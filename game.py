@@ -21,6 +21,10 @@ YELLOW = (255, 255, 0)
 # Player settings
 PLAYER_SIZE = 30
 PLAYER_SPEED = 5
+SPRINT_SPEED_MULTIPLIER = 2.0  # Sprint is 2x speed
+SPRINT_MAX = 100.0  # Maximum sprint energy
+SPRINT_DEPLETION_RATE = 30.0  # Energy lost per second while sprinting
+SPRINT_RECHARGE_RATE = 20.0  # Energy gained per second when not sprinting
 
 # Projectile settings
 PROJECTILE_SIZE = 10
@@ -29,8 +33,10 @@ PROJECTILE_SPEED = 10
 # Enemy settings
 ENEMY_SIZE = 25
 ENEMY_SPEED = 2
-ENEMY_SPAWN_RATE = 60  # Spawns every N frames
+INITIAL_ENEMY_SPAWN_RATE = 60  # Initial spawn rate (spawns every N frames)
+MIN_ENEMY_SPAWN_RATE = 20  # Minimum spawn rate (fastest spawning)
 MAX_ENEMIES = 10
+ENEMY_SPAWN_ACCELERATION = 0.5  # How fast spawn rate decreases (frames per second)
 
 class Player:
     def __init__(self, x, y, batch):
@@ -39,6 +45,12 @@ class Player:
         self.size = PLAYER_SIZE
         self.speed = PLAYER_SPEED
         self.batch = batch
+        # Sprint system
+        self.sprint_energy = SPRINT_MAX  # Start with full sprint
+        self.is_sprinting = False
+        # Track last movement direction for shooting
+        self.last_direction_x = 0
+        self.last_direction_y = 1  # Default: facing up
         # Create a solid color image for the player sprite (more reliable than shapes)
         # Create image data with solid green color (RGBA format: 0x00FF00FF = green opaque)
         format = 'RGBA'
@@ -48,16 +60,45 @@ class Player:
         self.sprite = pyglet.sprite.Sprite(self.image, x=x, y=y, batch=batch)
         self.sprite.visible = True
         
-    def update(self, keys):
+    def update(self, keys, dt):
+        # Check if sprinting (spacebar held)
+        self.is_sprinting = keys[pyglet.window.key.SPACE] and self.sprint_energy > 0
+        
+        # Update sprint energy
+        if self.is_sprinting:
+            self.sprint_energy -= SPRINT_DEPLETION_RATE * dt
+            self.sprint_energy = max(0, self.sprint_energy)
+        else:
+            self.sprint_energy += SPRINT_RECHARGE_RATE * dt
+            self.sprint_energy = min(SPRINT_MAX, self.sprint_energy)
+        
+        # Calculate current speed (sprint multiplier if sprinting and has energy)
+        current_speed = self.speed
+        if self.is_sprinting and self.sprint_energy > 0:
+            current_speed = self.speed * SPRINT_SPEED_MULTIPLIER
+        
+        # Track movement direction
+        move_x = 0
+        move_y = 0
+        
         # Movement (using KeyStateHandler)
         if keys[pyglet.window.key.W] or keys[pyglet.window.key.UP]:
-            self.y += self.speed
+            self.y += current_speed
+            move_y += 1
         if keys[pyglet.window.key.S] or keys[pyglet.window.key.DOWN]:
-            self.y -= self.speed
+            self.y -= current_speed
+            move_y -= 1
         if keys[pyglet.window.key.A] or keys[pyglet.window.key.LEFT]:
-            self.x -= self.speed
+            self.x -= current_speed
+            move_x -= 1
         if keys[pyglet.window.key.D] or keys[pyglet.window.key.RIGHT]:
-            self.x += self.speed
+            self.x += current_speed
+            move_x += 1
+        
+        # Update last direction if moving
+        if move_x != 0 or move_y != 0:
+            self.last_direction_x = move_x
+            self.last_direction_y = move_y
         
         # Keep player on screen
         self.x = max(0, min(SCREEN_WIDTH - self.size, self.x))
@@ -66,6 +107,14 @@ class Player:
         # Update sprite position
         self.sprite.x = self.x
         self.sprite.y = self.y
+    
+    def get_sprint_percentage(self):
+        """Return sprint energy as a percentage (0.0 to 1.0)"""
+        return self.sprint_energy / SPRINT_MAX
+    
+    def get_shoot_direction(self):
+        """Return the direction the player should shoot (normalized)"""
+        return (self.last_direction_x, self.last_direction_y)
     
     def get_center(self):
         return (self.x + self.size / 2, self.y + self.size / 2)
@@ -163,7 +212,12 @@ class GameWindow(pyglet.window.Window):
         self.enemies = []
         self.frame_count = 0
         
-        # Track mouse position
+        # Enemy spawning
+        self.enemy_spawn_rate = INITIAL_ENEMY_SPAWN_RATE
+        self.enemy_spawn_counter = 0
+        self.game_time = 0.0  # Track game time in seconds
+        
+        # Track mouse position (no longer used for shooting, but kept for compatibility)
         self.mouse_x = SCREEN_WIDTH // 2
         self.mouse_y = SCREEN_HEIGHT // 2
         
@@ -181,6 +235,22 @@ class GameWindow(pyglet.window.Window):
             batch=self.batch
         )
         
+        # Sprint bar
+        self.sprint_bar_bg = shapes.Rectangle(
+            10, 10, 200, 15, color=(50, 50, 50), batch=self.batch
+        )
+        self.sprint_bar_fill = shapes.Rectangle(
+            12, 12, 196, 11, color=(0, 200, 255), batch=self.batch
+        )
+        self.sprint_label = pyglet.text.Label(
+            'Sprint',
+            font_name='Arial',
+            font_size=12,
+            x=10, y=30,
+            color=WHITE,
+            batch=self.batch
+        )
+        
         # Note: We don't need a background rectangle since we clear to black in on_draw()
         
         # Schedule update
@@ -192,16 +262,25 @@ class GameWindow(pyglet.window.Window):
         self.mouse_y = SCREEN_HEIGHT - y  # Convert to bottom-left origin
     
     def on_key_press(self, symbol, modifiers):
-        if symbol == pyglet.window.key.SPACE:
-            # Shoot projectile towards mouse position
+        # Arrow keys fire projectiles in their direction
+        direction_x = 0
+        direction_y = 0
+        
+        if symbol == pyglet.window.key.UP:
+            direction_y = 1
+        elif symbol == pyglet.window.key.DOWN:
+            direction_y = -1
+        elif symbol == pyglet.window.key.LEFT:
+            direction_x = -1
+        elif symbol == pyglet.window.key.RIGHT:
+            direction_x = 1
+        
+        # If an arrow key was pressed, shoot a projectile
+        if direction_x != 0 or direction_y != 0:
             player_center_x, player_center_y = self.player.get_center()
-            direction_x = self.mouse_x - player_center_x
-            direction_y = self.mouse_y - player_center_y
-            
-            # Default direction if mouse is at player center (shoot up)
-            if abs(direction_x) < 0.1 and abs(direction_y) < 0.1:
-                direction_x = 0
-                direction_y = 100
+            # Scale direction for shooting
+            direction_x = direction_x * 100
+            direction_y = direction_y * 100
             
             self.projectiles.append(Projectile(
                 player_center_x - PROJECTILE_SIZE / 2,
@@ -213,18 +292,30 @@ class GameWindow(pyglet.window.Window):
     
     def update(self, dt):
         self.frame_count += 1
+        self.game_time += dt
         
-        # Update player with current key states
-        self.player.update(self.keys)
+        # Update player with current key states (pass dt for sprint recharge)
+        self.player.update(self.keys, dt)
+        
+        # Update sprint bar display
+        sprint_percent = self.player.get_sprint_percentage()
+        self.sprint_bar_fill.width = 196 * sprint_percent
         
         # Update projectiles
         self.projectiles = [p for p in self.projectiles if not p.is_off_screen()]
         for projectile in self.projectiles:
             projectile.update()
         
-        # Spawn enemies
-        if len(self.enemies) < MAX_ENEMIES and self.frame_count % ENEMY_SPAWN_RATE == 0:
+        # Gradually increase enemy spawn rate over time
+        # Lower spawn_rate = faster spawning
+        new_spawn_rate = INITIAL_ENEMY_SPAWN_RATE - (self.game_time * ENEMY_SPAWN_ACCELERATION)
+        self.enemy_spawn_rate = max(MIN_ENEMY_SPAWN_RATE, new_spawn_rate)
+        
+        # Spawn enemies based on current spawn rate
+        self.enemy_spawn_counter += 1
+        if len(self.enemies) < MAX_ENEMIES and self.enemy_spawn_counter >= self.enemy_spawn_rate:
             self.enemies.append(spawn_enemy(self.batch))
+            self.enemy_spawn_counter = 0
         
         # Update enemies
         player_center_x, player_center_y = self.player.get_center()

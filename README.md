@@ -4,9 +4,12 @@ A simple 2D game where you control a blue cube that can move around and shoot pr
 
 ## Features
 
-- **Player Control**: Move your blue cube using W, A, S, D keys
-- **Shooting**: Press SPACEBAR to shoot yellow projectiles toward your mouse cursor
+- **Player Control**: Move your green cube using W, A, S, D keys
+- **Shooting**: Press ARROW KEYS to shoot yellow projectiles in that direction
+- **Sprint**: Hold SPACEBAR to sprint at 2x speed (uses sprint energy)
+- **Sprint Bar**: Sprint energy slowly recharges over time - use it wisely!
 - **Enemies**: Red enemy cubes spawn randomly from the edges and chase you
+- **Dynamic Difficulty**: Enemy spawn rate increases over time
 - **Combat**: Enemies disappear when hit by projectiles
 
 ## Installation
@@ -29,7 +32,8 @@ python game.py
 - **A** / **←**: Move left
 - **S** / **↓**: Move down
 - **D** / **→**: Move right
-- **SPACEBAR**: Shoot projectile toward mouse cursor
+- **Arrow Keys** (↑ ↓ ← →): Fire projectiles in the direction of the arrow key pressed
+- **SPACEBAR** (Hold): Sprint at 2x speed (consumes sprint energy shown in the bar)
 
 ## Game Rules
 
