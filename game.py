@@ -73,8 +73,11 @@ HARVEST_RANGE = 60
   # Distance from player center to tree center for harvesting (pixels)
 
 # Wall/Building settings
-WALL_SIZE = 35  # Size of wooden wall
 WALL_WOOD_COST = 1  # Wood required to build a wall
+
+# Grid system settings (snap everything to character-sized cubes)
+GRID_SIZE = PLAYER_SIZE  # Grid cells are player-sized
+WALL_SIZE = GRID_SIZE  # Walls are same size as grid cells for uniformity
 
 class Camera:
     """Camera that follows the player"""
@@ -769,16 +772,81 @@ def spawn_enemy(batch, player_x=None, player_y=None, obstacles=None):
         return Enemy(-ENEMY_SIZE, random.randint(0, WORLD_HEIGHT), batch)
 
 def generate_rocks(batch, num_rocks, exclude_x=None, exclude_y=None, exclude_radius=300):
-    """Generate rocks randomly across the world at game start"""
+    """Generate rocks randomly across the world, snapped to grid and clustered"""
     rocks = []
     attempts = 0
-    max_attempts = num_rocks * 20  # Try many times to place rocks
+    max_attempts = num_rocks * 30
     
+    # Create cluster centers (fewer clusters than rocks)
+    num_clusters = max(3, num_rocks // 8)  # About 8 rocks per cluster
+    cluster_centers = []
+    
+    for _ in range(num_clusters):
+        cluster_x = random.randint(GRID_SIZE * 5, WORLD_WIDTH - GRID_SIZE * 5)
+        cluster_y = random.randint(GRID_SIZE * 5, WORLD_HEIGHT - GRID_SIZE * 5)
+        # Snap cluster center to grid
+        cluster_x, cluster_y = snap_to_grid(cluster_x, cluster_y)
+        cluster_centers.append((cluster_x, cluster_y))
+    
+    # Generate rocks in clusters
+    rocks_per_cluster = num_rocks // num_clusters
+    remaining_rocks = num_rocks
+    
+    for cluster_x, cluster_y in cluster_centers:
+        cluster_rocks = 0
+        cluster_max = rocks_per_cluster if remaining_rocks > rocks_per_cluster else remaining_rocks
+        
+        # Try to place rocks near this cluster center
+        cluster_radius = GRID_SIZE * 8  # Cluster radius in pixels
+        
+        while cluster_rocks < cluster_max and attempts < max_attempts:
+            attempts += 1
+            
+            # Random position within cluster radius
+            angle = random.uniform(0, 2 * math.pi)
+            distance = random.uniform(0, cluster_radius)
+            x = cluster_x + math.cos(angle) * distance
+            y = cluster_y + math.sin(angle) * distance
+            
+            # Snap to grid
+            x, y = snap_to_grid(x, y)
+            
+            # Use uniform size (grid-aligned)
+            size = GRID_SIZE
+            
+            # Keep within world bounds
+            if x < size or x > WORLD_WIDTH - size or y < size or y > WORLD_HEIGHT - size:
+                continue
+            
+            # Skip if too close to starting position
+            if exclude_x and exclude_y:
+                dist = math.sqrt((x - exclude_x)**2 + (y - exclude_y)**2)
+                if dist < exclude_radius:
+                    continue
+            
+            # Check if this position overlaps with existing rocks
+            new_rect = (x - size // 2, y - size // 2, size, size)
+            overlap = False
+            for existing in rocks:
+                if check_collision(new_rect, existing.get_rect()):
+                    overlap = True
+                    break
+            
+            if not overlap:
+                rocks.append(Rock(x - size // 2, y - size // 2, size, batch))
+                cluster_rocks += 1
+                remaining_rocks -= 1
+        
+        if remaining_rocks <= 0:
+            break
+    
+    # Fill remaining rocks randomly if we didn't place enough
     while len(rocks) < num_rocks and attempts < max_attempts:
         attempts += 1
-        size = random.randint(ROCK_MIN_SIZE, ROCK_MAX_SIZE)
-        x = random.randint(size, WORLD_WIDTH - size)
-        y = random.randint(size, WORLD_HEIGHT - size)
+        x = random.randint(GRID_SIZE * 2, WORLD_WIDTH - GRID_SIZE * 2)
+        y = random.randint(GRID_SIZE * 2, WORLD_HEIGHT - GRID_SIZE * 2)
+        x, y = snap_to_grid(x, y)
+        size = GRID_SIZE
         
         # Skip if too close to starting position
         if exclude_x and exclude_y:
@@ -786,8 +854,7 @@ def generate_rocks(batch, num_rocks, exclude_x=None, exclude_y=None, exclude_rad
             if dist < exclude_radius:
                 continue
         
-        # Check if this position overlaps with existing rocks
-        new_rect = (x, y, size, size)
+        new_rect = (x - size // 2, y - size // 2, size, size)
         overlap = False
         for existing in rocks:
             if check_collision(new_rect, existing.get_rect()):
@@ -795,7 +862,7 @@ def generate_rocks(batch, num_rocks, exclude_x=None, exclude_y=None, exclude_rad
                 break
         
         if not overlap:
-            rocks.append(Rock(x, y, size, batch))
+            rocks.append(Rock(x - size // 2, y - size // 2, size, batch))
     
     return rocks
 
@@ -843,6 +910,97 @@ def check_collision(rect1, rect2):
     x2, y2, w2, h2 = rect2
     return (x1 < x2 + w2 and x1 + w1 > x2 and
             y1 < y2 + h2 and y1 + h1 > y2)
+
+def snap_to_grid(x, y):
+    """Snap coordinates to the grid"""
+    grid_x = (x // GRID_SIZE) * GRID_SIZE + GRID_SIZE // 2
+    grid_y = (y // GRID_SIZE) * GRID_SIZE + GRID_SIZE // 2
+    return grid_x, grid_y
+
+class GameOverWindow(pyglet.window.Window):
+    """Game over screen with options to retry or return to menu"""
+    def __init__(self, day_count, is_multiplayer=False, is_host=False, host_ip='127.0.0.1'):
+        super().__init__(width=SCREEN_WIDTH, height=SCREEN_HEIGHT, caption="Game Over")
+        self.batch = pyglet.graphics.Batch()
+        self.is_multiplayer = is_multiplayer
+        self.is_host = is_host
+        self.host_ip = host_ip
+        
+        # Game over title
+        self.title_label = pyglet.text.Label(
+            'GAME OVER',
+            font_name='Arial',
+            font_size=48,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 150,
+            anchor_x='center', anchor_y='center',
+            color=(255, 50, 50, 255),
+            batch=self.batch
+        )
+        
+        # Day count
+        self.day_label = pyglet.text.Label(
+            f'You survived {day_count} day{"s" if day_count != 1 else ""}',
+            font_name='Arial',
+            font_size=24,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2 + 50,
+            anchor_x='center', anchor_y='center',
+            color=WHITE,
+            batch=self.batch
+        )
+        
+        # Options
+        self.retry_label = pyglet.text.Label(
+            '1. Try Again',
+            font_name='Arial',
+            font_size=32,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2 - 30,
+            anchor_x='center', anchor_y='center',
+            color=GREEN,
+            batch=self.batch
+        )
+        
+        self.menu_label = pyglet.text.Label(
+            '2. Return to Main Menu',
+            font_name='Arial',
+            font_size=32,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2 - 80,
+            anchor_x='center', anchor_y='center',
+            color=CYAN,
+            batch=self.batch
+        )
+        
+        self.instructions_label = pyglet.text.Label(
+            'Press 1 or 2 to select',
+            font_name='Arial',
+            font_size=16,
+            x=SCREEN_WIDTH // 2, y=100,
+            anchor_x='center', anchor_y='center',
+            color=WHITE,
+            batch=self.batch
+        )
+    
+    def on_key_press(self, symbol, modifiers):
+        if symbol == pyglet.window.key.NUM_1 or symbol == pyglet.window.key._1:
+            self.retry_game()
+        elif symbol == pyglet.window.key.NUM_2 or symbol == pyglet.window.key._2:
+            self.return_to_menu()
+    
+    def retry_game(self):
+        """Restart the game with same settings"""
+        self.close()
+        window = GameWindow(is_multiplayer=self.is_multiplayer, is_host=self.is_host, host_ip=self.host_ip)
+        pyglet.app.run()
+    
+    def return_to_menu(self):
+        """Go back to main menu"""
+        self.close()
+        menu = MenuWindow()
+        pyglet.app.run()
+    
+    def on_draw(self):
+        gl.glClearColor(0, 0, 0, 1)
+        self.clear()
+        self.batch.draw()
 
 class MenuWindow(pyglet.window.Window):
     def __init__(self):
@@ -1116,6 +1274,7 @@ class GameWindow(pyglet.window.Window):
         self.batch = pyglet.graphics.Batch()
         self.is_multiplayer = is_multiplayer
         self.is_host = is_host
+        self.host_ip = host_ip  # Store for game over screen
         self.my_player_id = 1 if is_host else 2
         
         # Network setup
@@ -1417,17 +1576,34 @@ class GameWindow(pyglet.window.Window):
         
         # Check if player has enough resources
         if resource == 'wood' and self.player.wood >= cost:
-            # Build wooden wall at player's position
+            # Build wooden wall at player's position, snapped to grid
             player_center_x, player_center_y = self.player.get_center()
+            grid_x, grid_y = snap_to_grid(player_center_x, player_center_y)
             
-            # Create the wall centered on the player
-            wall = Wall(player_center_x, player_center_y, self.batch, owner=self.player)
-            self.walls.append(wall)
+            # Check if there's already a wall at this grid position
+            wall_rect = (grid_x - WALL_SIZE // 2, grid_y - WALL_SIZE // 2, WALL_SIZE, WALL_SIZE)
+            can_build = True
+            for existing_wall in self.walls:
+                if check_collision(wall_rect, existing_wall.get_rect()):
+                    can_build = False
+                    break
             
-            # Deduct resources
-            self.player.wood -= cost
+            # Also check for rocks at this position
+            if can_build:
+                for rock in self.rocks:
+                    if check_collision(wall_rect, rock.get_rect()):
+                        can_build = False
+                        break
             
-            # Wall will become solid once player moves outside it
+            if can_build:
+                # Create the wall centered on the grid position
+                wall = Wall(grid_x, grid_y, self.batch, owner=self.player)
+                self.walls.append(wall)
+                
+                # Deduct resources
+                self.player.wood -= cost
+                
+                # Wall will become solid once player moves outside it
     
     def update_day_night_cycle(self):
         """Update the day/night cycle and related UI"""
@@ -1806,7 +1982,8 @@ class GameWindow(pyglet.window.Window):
             player_rect = self.player.get_rect()
             for enemy in self.enemies:
                 if check_collision(player_rect, enemy.get_rect()):
-                    self.close()
+                    # Show game over screen instead of closing
+                    self.show_game_over()
                     return
         
         # Update score label
@@ -1887,6 +2064,19 @@ class GameWindow(pyglet.window.Window):
         
         self.clear()
         self.batch.draw()
+    
+    def show_game_over(self):
+        """Show game over screen"""
+        if self.network:
+            self.network.close()
+        self.close()
+        game_over = GameOverWindow(
+            day_count=self.day_count,
+            is_multiplayer=self.is_multiplayer,
+            is_host=self.is_host,
+            host_ip=self.host_ip
+        )
+        pyglet.app.run()
     
     def on_close(self):
         if self.network:
