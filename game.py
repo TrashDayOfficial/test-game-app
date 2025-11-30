@@ -9,6 +9,25 @@ import json
 import struct
 import time
 
+# Global screen manager - holds the current active window
+class ScreenManager:
+    """Manages window transitions without multiple pyglet.app.run() calls"""
+    current_window = None
+    
+    @classmethod
+    def set_window(cls, window):
+        """Set the current window, closing the previous one if it exists"""
+        if cls.current_window is not None and cls.current_window != window:
+            try:
+                cls.current_window.close()
+            except:
+                pass
+        cls.current_window = window
+    
+    @classmethod
+    def get_window(cls):
+        return cls.current_window
+
 # Constants
 SCREEN_WIDTH = 800
 SCREEN_HEIGHT = 600
@@ -31,12 +50,16 @@ ORANGE = (255, 165, 0)
 
 # Player settings
 PLAYER_SIZE = 30
+PLAYER_HITBOX_MARGIN = 4  # Pixels smaller than visual size for smoother movement through gaps
 PLAYER_SPEED = 150
 PLAYER_MAX_HEALTH = 100
 PLAYER_HEALTH_REGEN_RATE = .05  # Health regen per second
 PLAYER_HEALTH_REGEN_DELAY = 10.0  # Delay before health regen starts
 PLAYER_HEALTH_REGEN_INTERVAL = 0.5  # Interval between health regen
 # Pixels per second (time-based movement)
+
+# Corner sliding threshold - how close to a gap before we auto-align
+CORNER_SLIDE_THRESHOLD = 8  # pixels
 
 # Projectile settings
 PROJECTILE_SIZE = 10
@@ -132,6 +155,7 @@ class Player:
         self.velocity_y = 0.0
         # Resources
         self.wood = 0
+        self.coins = 0
         # Create a solid color image for the player sprite
         format = 'RGBA'
         pitch = self.size * len(format)
@@ -142,6 +166,12 @@ class Player:
         self.sprite = pyglet.sprite.Sprite(self.image, x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2, batch=batch)
         self.sprite.visible = True
         
+    def get_hitbox(self):
+        """Return the collision hitbox (slightly smaller than visual for smoother movement)"""
+        margin = PLAYER_HITBOX_MARGIN
+        return (self.x + margin, self.y + margin, 
+                self.size - margin * 2, self.size - margin * 2)
+    
     def update(self, keys, dt, rocks=None, trees=None, walls=None):
         # Track movement direction
         move_x = 0
@@ -168,8 +198,12 @@ class Player:
             new_x += self.speed * dt
             move_x += 1
         
+        # Use smaller hitbox for collision (allows easier movement through gaps)
+        margin = PLAYER_HITBOX_MARGIN
+        hitbox_size = self.size - margin * 2
+        
         # Check collision with rocks and trees before moving
-        player_rect = (new_x, new_y, self.size, self.size)
+        player_rect = (new_x + margin, new_y + margin, hitbox_size, hitbox_size)
         can_move_x = True
         can_move_y = True
         
@@ -184,16 +218,53 @@ class Player:
             # Only check collision with solid walls (ones that are active)
             obstacles_to_check.extend([w for w in walls if w.is_solid])
         
+        blocking_obstacle = None
         for obstacle in obstacles_to_check:
             if check_collision(player_rect, obstacle.get_rect()):
+                blocking_obstacle = obstacle
                 # Try moving only X or only Y
-                test_x = (new_x, old_y, self.size, self.size)
-                test_y = (old_x, new_y, self.size, self.size)
+                test_x = (new_x + margin, old_y + margin, hitbox_size, hitbox_size)
+                test_y = (old_x + margin, new_y + margin, hitbox_size, hitbox_size)
                 
                 if check_collision(test_x, obstacle.get_rect()):
                     can_move_x = False
                 if check_collision(test_y, obstacle.get_rect()):
                     can_move_y = False
+        
+        # Corner sliding: if blocked in one direction, try to slide around corners
+        if blocking_obstacle and (not can_move_x or not can_move_y):
+            obs_rect = blocking_obstacle.get_rect()
+            obs_x, obs_y, obs_w, obs_h = obs_rect
+            player_center_x = old_x + self.size / 2
+            player_center_y = old_y + self.size / 2
+            obs_center_x = obs_x + obs_w / 2
+            obs_center_y = obs_y + obs_h / 2
+            
+            # If moving horizontally and blocked, try to slide vertically
+            if move_x != 0 and not can_move_x and can_move_y:
+                # Check if we're close to the top or bottom edge
+                top_dist = abs((player_center_y) - (obs_y + obs_h))
+                bot_dist = abs((player_center_y) - obs_y)
+                
+                if top_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
+                    # Slide up
+                    new_y += self.speed * dt * 0.5
+                elif bot_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
+                    # Slide down
+                    new_y -= self.speed * dt * 0.5
+            
+            # If moving vertically and blocked, try to slide horizontally
+            if move_y != 0 and not can_move_y and can_move_x:
+                # Check if we're close to the left or right edge
+                right_dist = abs((player_center_x) - (obs_x + obs_w))
+                left_dist = abs((player_center_x) - obs_x)
+                
+                if right_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
+                    # Slide right
+                    new_x += self.speed * dt * 0.5
+                elif left_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
+                    # Slide left
+                    new_x -= self.speed * dt * 0.5
         
         # Calculate velocity (for projectile inheritance) - in pixels per second
         if dt > 0:
@@ -926,7 +997,7 @@ class GameOverWindow(pyglet.window.Window):
         self.is_host = is_host
         self.host_ip = host_ip
         
-        # Game over title
+        # Game over title - use BASE dimensions for positioning
         self.title_label = pyglet.text.Label(
             'GAME OVER',
             font_name='Arial',
@@ -987,15 +1058,13 @@ class GameOverWindow(pyglet.window.Window):
     
     def retry_game(self):
         """Restart the game with same settings"""
-        self.close()
         window = GameWindow(is_multiplayer=self.is_multiplayer, is_host=self.is_host, host_ip=self.host_ip)
-        pyglet.app.run()
+        ScreenManager.set_window(window)
     
     def return_to_menu(self):
         """Go back to main menu"""
-        self.close()
         menu = MenuWindow()
-        pyglet.app.run()
+        ScreenManager.set_window(menu)
     
     def on_draw(self):
         gl.glClearColor(0, 0, 0, 1)
@@ -1007,7 +1076,7 @@ class MenuWindow(pyglet.window.Window):
         super().__init__(width=SCREEN_WIDTH, height=SCREEN_HEIGHT, caption="Cube Shooter Game - Menu")
         self.batch = pyglet.graphics.Batch()
         
-        # Menu items
+        # Menu items - use BASE dimensions for positioning
         self.title_label = pyglet.text.Label(
             'CUBE SHOOTER',
             font_name='Arial',
@@ -1060,7 +1129,7 @@ class MenuWindow(pyglet.window.Window):
         
         self.connecting_label = None
         self.host_ip_label = None
-        
+    
     def on_key_press(self, symbol, modifiers):
         if symbol == pyglet.window.key.NUM_1 or symbol == pyglet.window.key._1:
             self.start_single_player()
@@ -1070,9 +1139,8 @@ class MenuWindow(pyglet.window.Window):
             self.start_join()
     
     def start_single_player(self):
-        self.close()
         window = GameWindow(is_multiplayer=False)
-        pyglet.app.run()
+        ScreenManager.set_window(window)
     
     def start_host(self):
         local_ip = get_local_ip()
@@ -1085,9 +1153,8 @@ class MenuWindow(pyglet.window.Window):
         print("Share your IP address with your friend!")
         print("="*50 + "\n")
         
-        self.close()
         window = GameWindow(is_multiplayer=True, is_host=True)
-        pyglet.app.run()
+        ScreenManager.set_window(window)
     
     def start_join(self):
         # Simple IP input - you can type in console or modify for GUI input
@@ -1100,9 +1167,8 @@ class MenuWindow(pyglet.window.Window):
         print(f"Connecting to {host_ip}...")
         print("="*50 + "\n")
         
-        self.close()
         window = GameWindow(is_multiplayer=True, is_host=False, host_ip=host_ip)
-        pyglet.app.run()
+        ScreenManager.set_window(window)
     
     def on_draw(self):
         gl.glClearColor(0, 0, 0, 1)
@@ -1274,6 +1340,7 @@ class GameWindow(pyglet.window.Window):
         self.batch = pyglet.graphics.Batch()
         self.is_multiplayer = is_multiplayer
         self.is_host = is_host
+        self.game_active = True  # Track if game is still running
         self.host_ip = host_ip  # Store for game over screen
         self.my_player_id = 1 if is_host else 2
         
@@ -1339,7 +1406,7 @@ class GameWindow(pyglet.window.Window):
             1: {'name': 'Wooden Wall', 'cost': WALL_WOOD_COST, 'resource': 'wood'}
         }
         
-        # Build menu UI (created but hidden initially)
+        # Build menu UI (created but hidden initially) - use BASE dimensions
         self.build_menu_bg = shapes.Rectangle(
             SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT - 60,
             300, 50,
@@ -1383,7 +1450,7 @@ class GameWindow(pyglet.window.Window):
         self.cycle_time = 0.0  # Time within current day or night
         self.night_enemies_spawned = 0  # Track enemies spawned this night
         
-        # Track mouse position
+        # Track mouse position (in BASE coordinates)
         self.mouse_x = SCREEN_WIDTH // 2
         self.mouse_y = SCREEN_HEIGHT // 2
         
@@ -1416,21 +1483,87 @@ class GameWindow(pyglet.window.Window):
         self.reload_arc_y = 0
         self.reload_arc_progress = 0.0
         
-        # Labels
+        # Enemy counter (top right, smaller)
         self.score_label = pyglet.text.Label(
-            'Enemies: 0',
+            '0',
             font_name='Arial',
-            font_size=16,
-            x=10, y=SCREEN_HEIGHT - 25,
+            font_size=14,
+            x=SCREEN_WIDTH - 10, y=SCREEN_HEIGHT - 18,
+            anchor_x='right', anchor_y='center',
             color=WHITE,
             batch=self.batch
         )
         
+        # Wood icon and counter (top left) - log shape
+        # Log base (rounded rectangle effect using multiple shapes)
+        log_y = SCREEN_HEIGHT - 20
+        log_x = 10
+        # Main log body
+        self.wood_icon = shapes.Rectangle(
+            log_x, log_y - 12,
+            14, 12,
+            color=(139, 90, 43),  # Brown wood color
+            batch=self.batch
+        )
+        # Log top (rounded effect)
+        self.wood_top = shapes.Circle(
+            log_x + 7, log_y - 1,
+            7,
+            color=(139, 90, 43),
+            batch=self.batch
+        )
+        # Log bottom (rounded effect)
+        self.wood_bottom = shapes.Circle(
+            log_x + 7, log_y - 12,
+            7,
+            color=(139, 90, 43),
+            batch=self.batch
+        )
+        # Wood grain rings (concentric circles on the end)
+        self.wood_ring1 = shapes.Circle(
+            log_x + 7, log_y - 1,
+            4,
+            color=(120, 75, 35),  # Darker brown for grain
+            batch=self.batch
+        )
+        self.wood_ring2 = shapes.Circle(
+            log_x + 7, log_y - 1,
+            2,
+            color=(101, 67, 33),  # Even darker for inner ring
+            batch=self.batch
+        )
         self.wood_label = pyglet.text.Label(
-            'Wood: 0',
+            '0',
             font_name='Arial',
             font_size=16,
-            x=10, y=SCREEN_HEIGHT - 45,
+            x=30, y=log_y - 6,
+            anchor_y='center',
+            color=WHITE,
+            batch=self.batch
+        )
+        
+        # Coin icon and counter (top left, below wood)
+        coin_y = SCREEN_HEIGHT - 40
+        # Coin outer circle (gold)
+        self.coin_icon = shapes.Circle(
+            16, coin_y,
+            8,
+            color=(255, 215, 0),  # Gold color
+            batch=self.batch
+        )
+        # Coin inner highlight
+        self.coin_highlight = shapes.Circle(
+            16, coin_y,
+            5,
+            color=(255, 235, 100),  # Lighter gold for highlight
+            batch=self.batch
+        )
+        self.coin_label = pyglet.text.Label(
+            '0',
+            font_name='Arial',
+            font_size=16,
+            x=30, y=coin_y,
+            anchor_y='center',
             color=WHITE,
             batch=self.batch
         )
@@ -1528,7 +1661,7 @@ class GameWindow(pyglet.window.Window):
             # Add more building selections here as needed
         
         # Escape closes build menu
-        elif symbol == pyglet.window.key.ESCAPE:
+        if symbol == pyglet.window.key.ESCAPE:
             if self.build_menu_open:
                 self.toggle_build_menu(False)
     
@@ -1706,6 +1839,10 @@ class GameWindow(pyglet.window.Window):
             self.last_fire_time = current_time
     
     def update(self, dt):
+        # Skip update if game is no longer active
+        if not self.game_active:
+            return
+        
         self.frame_count += 1
         self.game_time += dt
         
@@ -1969,6 +2106,9 @@ class GameWindow(pyglet.window.Window):
         
         # Remove collided objects
         for enemy in enemies_to_remove:
+            # Give player coins for defeating enemy
+            if self.player:
+                self.player.coins += 1
             enemy.shape.delete()
             enemy.border.delete()
             self.enemies.remove(enemy)
@@ -1979,18 +2119,21 @@ class GameWindow(pyglet.window.Window):
         
         # Check if player is hit by enemy
         if self.player:
-            player_rect = self.player.get_rect()
+            player_rect = self.player.get_hitbox()  # Use smaller hitbox for fairer collision
             for enemy in self.enemies:
                 if check_collision(player_rect, enemy.get_rect()):
                     # Show game over screen instead of closing
                     self.show_game_over()
                     return
         
-        # Update score label
-        self.score_label.text = f"Enemies: {len(self.enemies)}"
+        # Update enemy counter (top right)
+        self.score_label.text = str(len(self.enemies))
         
-        # Update wood label
-        self.wood_label.text = f"Wood: {self.player.wood}"
+        # Update wood counter (top left)
+        self.wood_label.text = str(self.player.wood)
+        
+        # Update coin counter (top left, below wood)
+        self.coin_label.text = str(self.player.coins)
     
     def _clear_reload_arc(self):
         """Clear all arc segments"""
@@ -2067,18 +2210,22 @@ class GameWindow(pyglet.window.Window):
     
     def show_game_over(self):
         """Show game over screen"""
-        if self.network:
-            self.network.close()
-        self.close()
+        self.game_active = False
         game_over = GameOverWindow(
             day_count=self.day_count,
             is_multiplayer=self.is_multiplayer,
             is_host=self.is_host,
             host_ip=self.host_ip
         )
-        pyglet.app.run()
+        ScreenManager.set_window(game_over)
     
     def on_close(self):
+        """Clean up when window closes"""
+        self.game_active = False
+        # Unschedule the update function to prevent it from running after close
+        pyglet.clock.unschedule(self.update)
+        # Clean up reload arc segments
+        self._clear_reload_arc()
         if self.network:
             self.network.close()
         super().on_close()
@@ -2097,6 +2244,7 @@ def get_local_ip():
 def main():
     # Show menu first
     menu = MenuWindow()
+    ScreenManager.set_window(menu)
     pyglet.app.run()
 
 if __name__ == "__main__":
