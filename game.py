@@ -31,19 +31,26 @@ ORANGE = (255, 165, 0)
 
 # Player settings
 PLAYER_SIZE = 30
-PLAYER_SPEED = 300  # Pixels per second (time-based movement)
+PLAYER_SPEED = 150
+PLAYER_MAX_HEALTH = 100
+PLAYER_HEALTH_REGEN_RATE = .05  # Health regen per second
+PLAYER_HEALTH_REGEN_DELAY = 10.0  # Delay before health regen starts
+PLAYER_HEALTH_REGEN_INTERVAL = 0.5  # Interval between health regen
+# Pixels per second (time-based movement)
 
 # Projectile settings
 PROJECTILE_SIZE = 10
 PROJECTILE_SPEED = 10
+PROJECTILE_FIRE_RATE = 1  # Seconds between shots (1 shots per second)
 
 # Enemy settings
 ENEMY_SIZE = 25
 ENEMY_SPEED = 2
 INITIAL_ENEMY_SPAWN_RATE = 60  # Initial spawn rate (spawns every N frames)
 MIN_ENEMY_SPAWN_RATE = 20  # Minimum spawn rate (fastest spawning)
-MAX_ENEMIES = 10
+MAX_ENEMIES = 100
 ENEMY_SPAWN_ACCELERATION = 0.5  # How fast spawn rate decreases (frames per second)
+ENEMY_PATHFINDING_RANGE = 50  # Distance to check for obstacles when pathfinding
 
 # Rock settings
 ROCK_MIN_SIZE = 40
@@ -53,7 +60,9 @@ MAX_ROCKS = 50  # Generate this many rocks at game start
 # Tree settings
 TREE_SIZE = 25  # Smaller than rocks
 MAX_TREES = 80  # Generate this many trees at game start
-TREE_CHOP_TIME = 2.0  # Time in seconds to chop down a tree
+TREE_CHOP_TIME = 3.0  # Time in seconds to chop down a tree
+HARVEST_RANGE = 60
+  # Distance from player center to tree center for harvesting (pixels)
 
 class Camera:
     """Camera that follows the player"""
@@ -287,48 +296,220 @@ class Enemy:
         self.shape = shapes.Rectangle(0, 0, self.size, self.size, color=RED, batch=batch)
         self.border = shapes.Rectangle(0, 0, self.size, self.size, color=WHITE, batch=batch)
         self.border.opacity = 128  # Make border semi-transparent
+        # Pathfinding state
+        self.stuck_timer = 0.0
+        self.last_position = (x, y)
     
-    def update(self, player_x, player_y, dt, rocks=None):
-        # Chase the player (time-based movement for consistent speed)
-        dx = player_x - self.x
-        dy = player_y - self.y
+    def find_path_around_obstacle(self, target_x, target_y, obstacles, dt):
+        """Try to find a path around obstacles using steering behavior"""
+        # Get direction to target
+        dx = target_x - self.x
+        dy = target_y - self.y
         distance = math.sqrt(dx**2 + dy**2)
         
-        if distance > 0:
-            # Calculate intended movement
-            speed_per_frame = self.speed * dt * 60  # Convert to frame-based equivalent
-            new_x = self.x + (dx / distance) * speed_per_frame
-            new_y = self.y + (dy / distance) * speed_per_frame
+        if distance == 0:
+            return (0, 0)
+        
+        # Normalize direction
+        dir_x = dx / distance
+        dir_y = dy / distance
+        
+        # Check for obstacles in the path
+        look_ahead = ENEMY_PATHFINDING_RANGE
+        check_x = self.x + dir_x * look_ahead
+        check_y = self.y + dir_y * look_ahead
+        check_rect = (check_x - self.size/2, check_y - self.size/2, self.size, self.size)
+        
+        blocking_obstacle = None
+        for obstacle in obstacles:
+            if hasattr(obstacle, 'is_chopped') and obstacle.is_chopped:
+                continue
+            if check_collision(check_rect, obstacle.get_rect()):
+                blocking_obstacle = obstacle
+                break
+        
+        # If no obstacle, move directly
+        if not blocking_obstacle:
+            return (dir_x, dir_y)
+        
+        # Obstacle detected - try to steer around it
+        # Get obstacle center
+        obs_rect = blocking_obstacle.get_rect()
+        obs_center_x = obs_rect[0] + obs_rect[2] / 2
+        obs_center_y = obs_rect[1] + obs_rect[3] / 2
+        
+        # Calculate vector from obstacle to enemy
+        avoid_dx = self.x - obs_center_x
+        avoid_dy = self.y - obs_center_y
+        avoid_dist = math.sqrt(avoid_dx**2 + avoid_dy**2)
+        
+        if avoid_dist > 0:
+            # Normalize avoidance vector
+            avoid_dx /= avoid_dist
+            avoid_dy /= avoid_dist
             
-            # Store old position
-            old_x = self.x
-            old_y = self.y
+            # Blend direct path with avoidance (weighted toward avoidance when close)
+            obstacle_size = max(obs_rect[2], obs_rect[3])
+            avoid_strength = max(0, 1.0 - (avoid_dist / (obstacle_size + self.size)))
             
-            # Check collision with obstacles (rocks and trees) before moving
-            enemy_rect = (new_x, new_y, self.size, self.size)
-            can_move_x = True
-            can_move_y = True
+            # Combine direction to target with avoidance
+            steer_x = dir_x * (1.0 - avoid_strength) + avoid_dx * avoid_strength
+            steer_y = dir_y * (1.0 - avoid_strength) + avoid_dy * avoid_strength
             
-            if rocks:
-                for obstacle in rocks:
-                    # Handle both Rock and Tree objects
-                    if hasattr(obstacle, 'is_chopped') and obstacle.is_chopped:
-                        continue  # Skip chopped trees
-                    if check_collision(enemy_rect, obstacle.get_rect()):
-                        # Try moving only X or only Y
-                        test_x = (new_x, old_y, self.size, self.size)
-                        test_y = (old_x, new_y, self.size, self.size)
-                        
-                        if check_collision(test_x, obstacle.get_rect()):
-                            can_move_x = False
-                        if check_collision(test_y, obstacle.get_rect()):
-                            can_move_y = False
+            # Normalize
+            steer_len = math.sqrt(steer_x**2 + steer_y**2)
+            if steer_len > 0:
+                steer_x /= steer_len
+                steer_y /= steer_len
             
-            # Apply movement based on collision check
-            if can_move_x:
-                self.x = new_x
-            if can_move_y:
-                self.y = new_y
+            return (steer_x, steer_y)
+        
+        return (dir_x, dir_y)
+    
+    def update(self, player_x, player_y, dt, rocks=None, trees=None):
+        # Combine all obstacles
+        all_obstacles = []
+        if rocks:
+            all_obstacles.extend(rocks)
+        if trees:
+            all_obstacles.extend([t for t in trees if not t.is_chopped])
+        
+        # Use pathfinding to get direction
+        dir_x, dir_y = self.find_path_around_obstacle(player_x, player_y, all_obstacles, dt)
+        
+        # Calculate intended movement
+        speed_per_frame = self.speed * dt * 60  # Convert to frame-based equivalent
+        new_x = self.x + dir_x * speed_per_frame
+        new_y = self.y + dir_y * speed_per_frame
+        
+        # Store old position
+        old_x = self.x
+        old_y = self.y
+        
+        # Check collision with obstacles before moving
+        enemy_rect = (new_x, new_y, self.size, self.size)
+        can_move_x = True
+        can_move_y = True
+        
+        for obstacle in all_obstacles:
+            if check_collision(enemy_rect, obstacle.get_rect()):
+                # Try moving only X or only Y
+                test_x = (new_x, old_y, self.size, self.size)
+                test_y = (old_x, new_y, self.size, self.size)
+                
+                if check_collision(test_x, obstacle.get_rect()):
+                    can_move_x = False
+                if check_collision(test_y, obstacle.get_rect()):
+                    can_move_y = False
+        
+        # Check if enemy is currently touching an obstacle
+        current_rect = (self.x, self.y, self.size, self.size)
+        touching_obstacle = None
+        for obstacle in all_obstacles:
+            if check_collision(current_rect, obstacle.get_rect()):
+                touching_obstacle = obstacle
+                break
+        
+        # If touching an obstacle, prioritize perpendicular movement to get around it
+        if touching_obstacle:
+            # Get obstacle center
+            obs_rect = touching_obstacle.get_rect()
+            obs_center_x = obs_rect[0] + obs_rect[2] / 2
+            obs_center_y = obs_rect[1] + obs_rect[3] / 2
+            
+            # Calculate vector from obstacle to enemy
+            avoid_dx = self.x - obs_center_x
+            avoid_dy = self.y - obs_center_y
+            avoid_dist = math.sqrt(avoid_dx**2 + avoid_dy**2)
+            
+            if avoid_dist > 0:
+                # Normalize avoidance vector
+                avoid_dx /= avoid_dist
+                avoid_dy /= avoid_dist
+                
+                # Try perpendicular movement (rotate 90 degrees)
+                # Try both perpendicular directions
+                perp1_x = -avoid_dy
+                perp1_y = avoid_dx
+                perp2_x = avoid_dy
+                perp2_y = -avoid_dx
+                
+                # Try first perpendicular direction
+                test_new_x = self.x + perp1_x * speed_per_frame
+                test_new_y = self.y + perp1_y * speed_per_frame
+                test_rect = (test_new_x, test_new_y, self.size, self.size)
+                can_move_perp1 = True
+                for obstacle in all_obstacles:
+                    if check_collision(test_rect, obstacle.get_rect()):
+                        can_move_perp1 = False
+                        break
+                
+                if can_move_perp1:
+                    self.x = test_new_x
+                    self.y = test_new_y
+                else:
+                    # Try second perpendicular direction
+                    test_new_x = self.x + perp2_x * speed_per_frame
+                    test_new_y = self.y + perp2_y * speed_per_frame
+                    test_rect = (test_new_x, test_new_y, self.size, self.size)
+                    can_move_perp2 = True
+                    for obstacle in all_obstacles:
+                        if check_collision(test_rect, obstacle.get_rect()):
+                            can_move_perp2 = False
+                            break
+                    
+                    if can_move_perp2:
+                        self.x = test_new_x
+                        self.y = test_new_y
+                    # If both perpendicular directions blocked, try original movement
+                    elif can_move_x or can_move_y:
+                        if can_move_x:
+                            self.x = new_x
+                        if can_move_y:
+                            self.y = new_y
+            else:
+                # If completely blocked, try perpendicular movement to original direction
+                if not can_move_x and not can_move_y:
+                    perp_x = -dir_y
+                    perp_y = dir_x
+                    test_new_x = self.x + perp_x * speed_per_frame
+                    test_new_y = self.y + perp_y * speed_per_frame
+                    test_rect = (test_new_x, test_new_y, self.size, self.size)
+                    
+                    can_move_perp = True
+                    for obstacle in all_obstacles:
+                        if check_collision(test_rect, obstacle.get_rect()):
+                            can_move_perp = False
+                            break
+                    
+                    if can_move_perp:
+                        self.x = test_new_x
+                        self.y = test_new_y
+        else:
+            # Not touching obstacle - apply normal movement
+            if not can_move_x and not can_move_y:
+                # Try moving perpendicular to find a way around
+                perp_x = -dir_y
+                perp_y = dir_x
+                test_new_x = self.x + perp_x * speed_per_frame
+                test_new_y = self.y + perp_y * speed_per_frame
+                test_rect = (test_new_x, test_new_y, self.size, self.size)
+                
+                can_move_perp = True
+                for obstacle in all_obstacles:
+                    if check_collision(test_rect, obstacle.get_rect()):
+                        can_move_perp = False
+                        break
+                
+                if can_move_perp:
+                    self.x = test_new_x
+                    self.y = test_new_y
+            else:
+                # Apply movement based on collision check
+                if can_move_x:
+                    self.x = new_x
+                if can_move_y:
+                    self.y = new_y
         
         # Shape positions will be updated by camera in game loop
     
@@ -378,6 +559,11 @@ class Tree:
         self.is_chopped = False
         self.chop_progress = 0.0  # 0.0 to 1.0
         self.current_chop_target = None  # Player currently chopping
+        # Progress bar for harvesting
+        self.progress_bar_bg = shapes.Rectangle(0, 0, self.size + 10, 4, color=(50, 50, 50), batch=batch)
+        self.progress_bar_fg = shapes.Rectangle(0, 0, 0, 4, color=(0, 255, 0), batch=batch)
+        self.progress_bar_bg.visible = False
+        self.progress_bar_fg.visible = False
     
     def update_shape_position(self, camera):
         """Update shape position based on camera"""
@@ -390,6 +576,23 @@ class Tree:
         # Leaves on top
         self.leaves.x = screen_x
         self.leaves.y = screen_y + self.size // 3
+        
+        # Update progress bar position (above the tree)
+        bar_width = self.size + 10
+        bar_height = 4
+        self.progress_bar_bg.x = screen_x - bar_width // 2
+        self.progress_bar_bg.y = screen_y + self.size // 2 + 10
+        self.progress_bar_fg.x = screen_x - bar_width // 2
+        self.progress_bar_fg.y = screen_y + self.size // 2 + 10
+        
+        # Update progress bar visibility and width
+        if self.current_chop_target and self.chop_progress > 0:
+            self.progress_bar_bg.visible = True
+            self.progress_bar_fg.visible = True
+            self.progress_bar_fg.width = bar_width * self.chop_progress
+        else:
+            self.progress_bar_bg.visible = False
+            self.progress_bar_fg.visible = False
     
     def get_rect(self):
         return (self.x - self.size // 2, self.y - self.size // 2, self.size, self.size)
@@ -402,32 +605,69 @@ class Tree:
                 self.is_chopped = True
                 self.trunk.delete()
                 self.leaves.delete()
+                self.progress_bar_bg.delete()
+                self.progress_bar_fg.delete()
                 return True  # Tree chopped down
         return False
 
-def spawn_enemy(batch, player_x=None, player_y=None):
-    # Spawn enemies from the edges of the world or near player
-    if player_x is not None and player_y is not None:
-        # Spawn enemies near player but outside visible area
-        spawn_distance = max(SCREEN_WIDTH, SCREEN_HEIGHT) + 100
-        angle = random.uniform(0, 2 * math.pi)
-        spawn_x = player_x + math.cos(angle) * spawn_distance
-        spawn_y = player_y + math.sin(angle) * spawn_distance
-        # Clamp to world bounds
-        spawn_x = max(ENEMY_SIZE, min(WORLD_WIDTH - ENEMY_SIZE, spawn_x))
-        spawn_y = max(ENEMY_SIZE, min(WORLD_HEIGHT - ENEMY_SIZE, spawn_y))
-        return Enemy(spawn_x, spawn_y, batch)
-    else:
-        # Fallback: spawn at world edges
-        side = random.randint(0, 3)
-        if side == 0:  # Top
-            return Enemy(random.randint(0, WORLD_WIDTH), WORLD_HEIGHT, batch)
-        elif side == 1:  # Right
-            return Enemy(WORLD_WIDTH, random.randint(0, WORLD_HEIGHT), batch)
-        elif side == 2:  # Bottom
-            return Enemy(random.randint(0, WORLD_WIDTH), -ENEMY_SIZE, batch)
-        else:  # Left
-            return Enemy(-ENEMY_SIZE, random.randint(0, WORLD_HEIGHT), batch)
+def spawn_enemy(batch, player_x=None, player_y=None, obstacles=None):
+    """Spawn an enemy at a valid location (not inside obstacles)"""
+    obstacles = obstacles or []
+    max_attempts = 50  # Try up to 50 times to find a valid spawn location
+    
+    for attempt in range(max_attempts):
+        # Spawn enemies from the edges of the world or near player
+        if player_x is not None and player_y is not None:
+            # Spawn enemies near player but outside visible area
+            spawn_distance = max(SCREEN_WIDTH, SCREEN_HEIGHT) + 100
+            angle = random.uniform(0, 2 * math.pi)
+            spawn_x = player_x + math.cos(angle) * spawn_distance
+            spawn_y = player_y + math.sin(angle) * spawn_distance
+            # Clamp to world bounds
+            spawn_x = max(ENEMY_SIZE, min(WORLD_WIDTH - ENEMY_SIZE, spawn_x))
+            spawn_y = max(ENEMY_SIZE, min(WORLD_HEIGHT - ENEMY_SIZE, spawn_y))
+        else:
+            # Fallback: spawn at world edges
+            side = random.randint(0, 3)
+            if side == 0:  # Top
+                spawn_x = random.randint(0, WORLD_WIDTH)
+                spawn_y = WORLD_HEIGHT
+            elif side == 1:  # Right
+                spawn_x = WORLD_WIDTH
+                spawn_y = random.randint(0, WORLD_HEIGHT)
+            elif side == 2:  # Bottom
+                spawn_x = random.randint(0, WORLD_WIDTH)
+                spawn_y = -ENEMY_SIZE
+            else:  # Left
+                spawn_x = -ENEMY_SIZE
+                spawn_y = random.randint(0, WORLD_HEIGHT)
+        
+        # Check if spawn location is valid (not inside obstacles)
+        spawn_rect = (spawn_x, spawn_y, ENEMY_SIZE, ENEMY_SIZE)
+        valid_spawn = True
+        
+        for obstacle in obstacles:
+            # Skip chopped trees
+            if hasattr(obstacle, 'is_chopped') and obstacle.is_chopped:
+                continue
+            if check_collision(spawn_rect, obstacle.get_rect()):
+                valid_spawn = False
+                break
+        
+        if valid_spawn:
+            return Enemy(spawn_x, spawn_y, batch)
+    
+    # If we couldn't find a valid spawn after max attempts, spawn at edge anyway
+    # (better than not spawning at all)
+    side = random.randint(0, 3)
+    if side == 0:  # Top
+        return Enemy(random.randint(0, WORLD_WIDTH), WORLD_HEIGHT, batch)
+    elif side == 1:  # Right
+        return Enemy(WORLD_WIDTH, random.randint(0, WORLD_HEIGHT), batch)
+    elif side == 2:  # Bottom
+        return Enemy(random.randint(0, WORLD_WIDTH), -ENEMY_SIZE, batch)
+    else:  # Left
+        return Enemy(-ENEMY_SIZE, random.randint(0, WORLD_HEIGHT), batch)
 
 def generate_rocks(batch, num_rocks, exclude_x=None, exclude_y=None, exclude_radius=300):
     """Generate rocks randomly across the world at game start"""
@@ -845,6 +1085,35 @@ class GameWindow(pyglet.window.Window):
         self.keys = pyglet.window.key.KeyStateHandler()
         self.push_handlers(self.keys)
         
+        # Fire rate tracking
+        self.last_fire_time = 0.0
+        self.arrow_keys_pressed = {
+            pyglet.window.key.UP: False,
+            pyglet.window.key.DOWN: False,
+            pyglet.window.key.LEFT: False,
+            pyglet.window.key.RIGHT: False
+        }
+        
+        # Reload progress bar (tiny bar at top of screen)
+        self.reload_bar_width = 100
+        self.reload_bar_height = 3
+        self.reload_bar_bg = shapes.Rectangle(
+            SCREEN_WIDTH - self.reload_bar_width - 10, 
+            SCREEN_HEIGHT - 20, 
+            self.reload_bar_width, 
+            self.reload_bar_height, 
+            color=(50, 50, 50), 
+            batch=self.batch
+        )
+        self.reload_bar_fg = shapes.Rectangle(
+            SCREEN_WIDTH - self.reload_bar_width - 10, 
+            SCREEN_HEIGHT - 20, 
+            0, 
+            self.reload_bar_height, 
+            color=(255, 255, 0), 
+            batch=self.batch
+        )
+        
         # Labels
         self.score_label = pyglet.text.Label(
             'Enemies: 0',
@@ -899,20 +1168,50 @@ class GameWindow(pyglet.window.Window):
             pyglet.clock.schedule_once(lambda dt: self.check_connection(), 0.1)
     
     def on_key_press(self, symbol, modifiers):
-        # Arrow keys fire projectiles in their direction
+        # Track arrow key presses for continuous shooting
+        if symbol == pyglet.window.key.UP:
+            self.arrow_keys_pressed[pyglet.window.key.UP] = True
+        elif symbol == pyglet.window.key.DOWN:
+            self.arrow_keys_pressed[pyglet.window.key.DOWN] = True
+        elif symbol == pyglet.window.key.LEFT:
+            self.arrow_keys_pressed[pyglet.window.key.LEFT] = True
+        elif symbol == pyglet.window.key.RIGHT:
+            self.arrow_keys_pressed[pyglet.window.key.RIGHT] = True
+    
+    def on_key_release(self, symbol, modifiers):
+        # Track arrow key releases
+        if symbol == pyglet.window.key.UP:
+            self.arrow_keys_pressed[pyglet.window.key.UP] = False
+        elif symbol == pyglet.window.key.DOWN:
+            self.arrow_keys_pressed[pyglet.window.key.DOWN] = False
+        elif symbol == pyglet.window.key.LEFT:
+            self.arrow_keys_pressed[pyglet.window.key.LEFT] = False
+        elif symbol == pyglet.window.key.RIGHT:
+            self.arrow_keys_pressed[pyglet.window.key.RIGHT] = False
+    
+    def try_shoot(self, dt):
+        """Try to shoot a projectile if fire rate allows and arrow keys are pressed"""
+        current_time = self.game_time
+        
+        # Check if enough time has passed since last shot
+        if current_time - self.last_fire_time < PROJECTILE_FIRE_RATE:
+            return
+        
+        # Determine shooting direction from pressed arrow keys
         direction_x = 0
         direction_y = 0
         
-        if symbol == pyglet.window.key.UP:
+        if self.arrow_keys_pressed[pyglet.window.key.UP]:
             direction_y = 1
-        elif symbol == pyglet.window.key.DOWN:
+        elif self.arrow_keys_pressed[pyglet.window.key.DOWN]:
             direction_y = -1
-        elif symbol == pyglet.window.key.LEFT:
+        
+        if self.arrow_keys_pressed[pyglet.window.key.LEFT]:
             direction_x = -1
-        elif symbol == pyglet.window.key.RIGHT:
+        elif self.arrow_keys_pressed[pyglet.window.key.RIGHT]:
             direction_x = 1
         
-        # If an arrow key was pressed, shoot a projectile
+        # If an arrow key is pressed, shoot a projectile
         if direction_x != 0 or direction_y != 0:
             player_center_x, player_center_y = self.player.get_center()
             direction_x = direction_x * 100
@@ -929,6 +1228,7 @@ class GameWindow(pyglet.window.Window):
                 player_velocity_y=self.player.velocity_y
             )
             self.projectiles.append(projectile)
+            self.last_fire_time = current_time
     
     def update(self, dt):
         self.frame_count += 1
@@ -992,6 +1292,15 @@ class GameWindow(pyglet.window.Window):
         # Update player (pass rocks and trees for collision checking)
         self.player.update(self.keys, dt, rocks=self.rocks, trees=self.trees)
         
+        # Try to shoot (handles fire rate and held keys)
+        self.try_shoot(dt)
+        
+        # Update reload progress bar
+        current_time = self.game_time
+        time_since_last_shot = current_time - self.last_fire_time
+        reload_progress = min(1.0, time_since_last_shot / PROJECTILE_FIRE_RATE)
+        self.reload_bar_fg.width = self.reload_bar_width * reload_progress
+        
         # Update player sprite position (camera-based)
         self.player.update_sprite_position(self.camera)
         
@@ -999,24 +1308,53 @@ class GameWindow(pyglet.window.Window):
         if self.other_player:
             self.other_player.update_sprite_position(self.camera)
         
-        # Handle interaction (spacebar)
-        interact_key_pressed = self.keys[pyglet.window.key.SPACE]
+        # Handle harvesting (spacebar) - dedicated harvesting key
+        harvest_key_pressed = self.keys[pyglet.window.key.SPACE]
         nearby_tree = None
         
-        if interact_key_pressed and self.player:
-            player_rect = self.player.get_rect()
-            # Check if player is near a tree
+        if harvest_key_pressed and self.player:
+            # Get player center position
+            player_center_x, player_center_y = self.player.get_center()
+            
+            # Check if player is within harvest range of any tree (distance-based, not collision)
             for tree in self.trees:
-                if not tree.is_chopped and check_collision(player_rect, tree.get_rect()):
-                    nearby_tree = tree
-                    break
+                if tree.is_chopped:
+                    continue
+                
+                # Get tree center position
+                tree_rect = tree.get_rect()
+                tree_center_x = tree_rect[0] + tree_rect[2] / 2
+                tree_center_y = tree_rect[1] + tree_rect[3] / 2
+                
+                # Calculate distance from player center to tree center
+                dx = player_center_x - tree_center_x
+                dy = player_center_y - tree_center_y
+                distance = math.sqrt(dx**2 + dy**2)
+                
+                # Check if within harvest range
+                if distance <= HARVEST_RANGE:
+                    # If multiple trees in range, pick the closest one
+                    if nearby_tree is None:
+                        nearby_tree = tree
+                    else:
+                        # Check if this tree is closer
+                        old_tree_rect = nearby_tree.get_rect()
+                        old_tree_center_x = old_tree_rect[0] + old_tree_rect[2] / 2
+                        old_tree_center_y = old_tree_rect[1] + old_tree_rect[3] / 2
+                        old_dx = player_center_x - old_tree_center_x
+                        old_dy = player_center_y - old_tree_center_y
+                        old_distance = math.sqrt(old_dx**2 + old_dy**2)
+                        
+                        if distance < old_distance:
+                            nearby_tree = tree
+                    break  # Found a tree, can harvest it
         
-        # Update tree chopping
+        # Update tree chopping (harvesting)
         for tree in self.trees:
-            if tree == nearby_tree and interact_key_pressed:
+            if tree == nearby_tree and harvest_key_pressed:
                 tree.current_chop_target = self.player
                 if tree.update_chop(dt):
-                    # Tree chopped down
+                    # Tree chopped down - player gets wood
                     self.player.wood += 1
                     self.trees.remove(tree)
             else:
@@ -1044,7 +1382,9 @@ class GameWindow(pyglet.window.Window):
             
             self.enemy_spawn_timer += dt
             if len(self.enemies) < MAX_ENEMIES and self.enemy_spawn_timer >= spawn_interval:
-                enemy = spawn_enemy(self.batch, player_center_x, player_center_y)
+                # Get all obstacles for spawn validation
+                all_obstacles = list(self.rocks) + [t for t in self.trees if not t.is_chopped]
+                enemy = spawn_enemy(self.batch, player_center_x, player_center_y, obstacles=all_obstacles)
                 self.enemies.append(enemy)
                 # Immediately position enemy sprite
                 enemy.update_shape_position(self.camera)
@@ -1060,10 +1400,10 @@ class GameWindow(pyglet.window.Window):
                     })
         
         # Update enemies (chase closest player) - pass dt for time-based movement
-        # Pass all obstacles (rocks and non-chopped trees) for collision
+        # Pass all obstacles (rocks and non-chopped trees) for collision and pathfinding
         all_obstacles = list(self.rocks) + [t for t in self.trees if not t.is_chopped]
         for enemy in self.enemies:
-            enemy.update(player_center_x, player_center_y, dt, rocks=all_obstacles)
+            enemy.update(player_center_x, player_center_y, dt, rocks=self.rocks, trees=self.trees)
             enemy.update_shape_position(self.camera)
         
         # Update rock positions
