@@ -47,10 +47,18 @@ PROJECTILE_FIRE_RATE = .5  # Seconds between shots (2 shots per second)
 ENEMY_SIZE = 25
 ENEMY_SPEED = 2
 INITIAL_ENEMY_SPAWN_RATE = 60  # Initial spawn rate (spawns every N frames)
-MIN_ENEMY_SPAWN_RATE = 20  # Minimum spawn rate (fastest spawning)
-MAX_ENEMIES = 100
+MIN_ENEMY_SPAWN_RATE = 10  # Minimum spawn rate (fastest spawning)
+MAX_ENEMIES = 150
 ENEMY_SPAWN_ACCELERATION = 0.5  # How fast spawn rate decreases (frames per second)
 ENEMY_PATHFINDING_RANGE = 50  # Distance to check for obstacles when pathfinding
+
+# Day/Night cycle settings
+DAY_LENGTH = 60.0  # Day duration in seconds (60 = 1 minute)
+NIGHT_LENGTH = 45.0  # Night duration in seconds
+NIGHT_SPAWN_MULTIPLIER_BASE = 1.5  # Base spawn rate multiplier at night
+NIGHT_SPAWN_MULTIPLIER_PER_DAY = 0.3  # Additional spawn multiplier per day survived
+NIGHT_MAX_ENEMIES_BASE = 30  # Base max enemies at night
+NIGHT_MAX_ENEMIES_PER_DAY = 10  # Additional max enemies per day survived
 
 # Rock settings
 ROCK_MIN_SIZE = 40
@@ -63,6 +71,10 @@ MAX_TREES = 80  # Generate this many trees at game start
 TREE_CHOP_TIME = 1.5  # Time in seconds to chop down a tree
 HARVEST_RANGE = 60
   # Distance from player center to tree center for harvesting (pixels)
+
+# Wall/Building settings
+WALL_SIZE = 35  # Size of wooden wall
+WALL_WOOD_COST = 1  # Wood required to build a wall
 
 class Camera:
     """Camera that follows the player"""
@@ -127,7 +139,7 @@ class Player:
         self.sprite = pyglet.sprite.Sprite(self.image, x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2, batch=batch)
         self.sprite.visible = True
         
-    def update(self, keys, dt, rocks=None, trees=None):
+    def update(self, keys, dt, rocks=None, trees=None, walls=None):
         # Track movement direction
         move_x = 0
         move_y = 0
@@ -158,13 +170,16 @@ class Player:
         can_move_x = True
         can_move_y = True
         
-        # Check collision with all obstacles (rocks and trees)
+        # Check collision with all obstacles (rocks, trees, and solid walls)
         obstacles_to_check = []
         if rocks:
             obstacles_to_check.extend(rocks)
         if trees:
             # Only check collision with non-chopped trees
             obstacles_to_check.extend([t for t in trees if not t.is_chopped])
+        if walls:
+            # Only check collision with solid walls (ones that are active)
+            obstacles_to_check.extend([w for w in walls if w.is_solid])
         
         for obstacle in obstacles_to_check:
             if check_collision(player_rect, obstacle.get_rect()):
@@ -392,13 +407,15 @@ class Enemy:
         
         return (dir_x, dir_y)
     
-    def update(self, player_x, player_y, dt, rocks=None, trees=None):
+    def update(self, player_x, player_y, dt, rocks=None, trees=None, walls=None):
         # Combine all obstacles
         all_obstacles = []
         if rocks:
             all_obstacles.extend(rocks)
         if trees:
             all_obstacles.extend([t for t in trees if not t.is_chopped])
+        if walls:
+            all_obstacles.extend([w for w in walls if w.is_solid])
         
         # Use pathfinding to get direction
         dir_x, dir_y = self.find_path_around_obstacle(player_x, player_y, all_obstacles, dt)
@@ -570,6 +587,62 @@ class Rock:
     
     def get_rect(self):
         return (self.x, self.y, self.size, self.size)
+
+class Wall:
+    """Player-built wooden wall"""
+    def __init__(self, x, y, batch, owner=None):
+        self.x = x  # World coordinates (center position)
+        self.y = y
+        self.size = WALL_SIZE
+        self.batch = batch
+        self.owner = owner  # Player who built the wall
+        self.is_solid = False  # Becomes solid after owner leaves the hitbox
+        
+        # Wooden wall appearance - brown with wood grain effect
+        self.shape = shapes.Rectangle(0, 0, self.size, self.size, color=(139, 90, 43), batch=batch)
+        self.border = shapes.Rectangle(0, 0, self.size, self.size, color=(101, 67, 33), batch=batch)
+        self.border.opacity = 200
+        # Horizontal wood grain lines
+        self.grain1 = shapes.Rectangle(0, 0, self.size - 4, 2, color=(120, 75, 35), batch=batch)
+        self.grain2 = shapes.Rectangle(0, 0, self.size - 4, 2, color=(120, 75, 35), batch=batch)
+        self.grain3 = shapes.Rectangle(0, 0, self.size - 4, 2, color=(120, 75, 35), batch=batch)
+    
+    def update_shape_position(self, camera):
+        """Update shape position based on camera"""
+        screen_x, screen_y = camera.world_to_screen(self.x - self.size // 2, self.y - self.size // 2)
+        self.shape.x = screen_x
+        self.shape.y = screen_y
+        self.border.x = screen_x
+        self.border.y = screen_y
+        # Position grain lines
+        self.grain1.x = screen_x + 2
+        self.grain1.y = screen_y + self.size // 4
+        self.grain2.x = screen_x + 2
+        self.grain2.y = screen_y + self.size // 2
+        self.grain3.x = screen_x + 2
+        self.grain3.y = screen_y + 3 * self.size // 4
+    
+    def get_rect(self):
+        """Return collision rectangle (centered on position)"""
+        return (self.x - self.size // 2, self.y - self.size // 2, self.size, self.size)
+    
+    def check_owner_outside(self, player):
+        """Check if the owner has moved outside the wall's hitbox"""
+        if not self.is_solid and self.owner == player:
+            player_rect = player.get_rect()
+            wall_rect = self.get_rect()
+            if not check_collision(player_rect, wall_rect):
+                self.is_solid = True
+                return True
+        return False
+    
+    def delete(self):
+        """Clean up shapes"""
+        self.shape.delete()
+        self.border.delete()
+        self.grain1.delete()
+        self.grain2.delete()
+        self.grain3.delete()
 
 class Tree:
     def __init__(self, x, y, batch, tree_id=None):
@@ -1097,11 +1170,59 @@ class GameWindow(pyglet.window.Window):
         for tree in self.trees:
             tree.update_shape_position(self.camera)
         
+        # Player-built structures
+        self.walls = []
+        
+        # Build mode state
+        self.build_menu_open = False
+        self.selected_building = 1  # Default to first building (wooden wall)
+        self.building_types = {
+            1: {'name': 'Wooden Wall', 'cost': WALL_WOOD_COST, 'resource': 'wood'}
+        }
+        
+        # Build menu UI (created but hidden initially)
+        self.build_menu_bg = shapes.Rectangle(
+            SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT - 60,
+            300, 50,
+            color=(30, 30, 30),
+            batch=self.batch
+        )
+        self.build_menu_bg.opacity = 180
+        self.build_menu_bg.visible = False
+        
+        self.build_menu_title = pyglet.text.Label(
+            'BUILD MENU (1-9 to select, F to build)',
+            font_name='Arial',
+            font_size=10,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 18,
+            anchor_x='center', anchor_y='center',
+            color=(255, 255, 255, 255),
+            batch=self.batch
+        )
+        self.build_menu_title.visible = False
+        
+        self.build_menu_item1 = pyglet.text.Label(
+            f'[1] Wooden Wall ({WALL_WOOD_COST} wood)',
+            font_name='Arial',
+            font_size=12,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 42,
+            anchor_x='center', anchor_y='center',
+            color=(255, 255, 0, 255),  # Yellow for selected
+            batch=self.batch
+        )
+        self.build_menu_item1.visible = False
+        
         # Enemy spawning (only host spawns enemies in multiplayer)
         self.enemy_spawn_rate = INITIAL_ENEMY_SPAWN_RATE
         self.enemy_spawn_counter = 0
         self.enemy_spawn_timer = 0.0  # Initialize timer
         self.game_time = 0.0
+        
+        # Day/Night cycle state
+        self.day_count = 1  # Start on day 1
+        self.is_night = False
+        self.cycle_time = 0.0  # Time within current day or night
+        self.night_enemies_spawned = 0  # Track enemies spawned this night
         
         # Track mouse position
         self.mouse_x = SCREEN_WIDTH // 2
@@ -1155,6 +1276,38 @@ class GameWindow(pyglet.window.Window):
             batch=self.batch
         )
         
+        # Day/Night cycle labels (bottom left)
+        self.day_label = pyglet.text.Label(
+            'Day 1',
+            font_name='Arial',
+            font_size=18,
+            x=10, y=30,
+            color=(255, 200, 50, 255),  # Golden yellow
+            batch=self.batch
+        )
+        
+        self.time_label = pyglet.text.Label(
+            'Daytime - Gather resources!',
+            font_name='Arial',
+            font_size=14,
+            x=10, y=10,
+            color=(255, 255, 150, 255),  # Light yellow
+            batch=self.batch
+        )
+        
+        # Night warning overlay (hidden by default)
+        self.night_warning = pyglet.text.Label(
+            'NIGHT APPROACHES!',
+            font_name='Arial',
+            font_size=24,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT // 2 + 50,
+            anchor_x='center', anchor_y='center',
+            color=(255, 50, 50, 255),
+            batch=self.batch
+        )
+        self.night_warning.visible = False
+        self.night_warning_timer = 0.0
+        
         if is_multiplayer:
             self.connection_label = pyglet.text.Label(
                 'Connected' if self.network and self.network.connected else 'Connecting...',
@@ -1199,6 +1352,26 @@ class GameWindow(pyglet.window.Window):
             self.arrow_keys_pressed[pyglet.window.key.LEFT] = True
         elif symbol == pyglet.window.key.RIGHT:
             self.arrow_keys_pressed[pyglet.window.key.RIGHT] = True
+        
+        # Build mode - F key toggles menu, also builds when menu is open
+        elif symbol == pyglet.window.key.F:
+            if self.build_menu_open:
+                # Try to build the selected structure
+                self.try_build()
+            else:
+                # Open build menu
+                self.toggle_build_menu(True)
+        
+        # Number keys select building type (when menu is open)
+        elif self.build_menu_open:
+            if symbol == pyglet.window.key._1 or symbol == pyglet.window.key.NUM_1:
+                self.select_building(1)
+            # Add more building selections here as needed
+        
+        # Escape closes build menu
+        elif symbol == pyglet.window.key.ESCAPE:
+            if self.build_menu_open:
+                self.toggle_build_menu(False)
     
     def on_key_release(self, symbol, modifiers):
         # Track arrow key releases
@@ -1210,6 +1383,110 @@ class GameWindow(pyglet.window.Window):
             self.arrow_keys_pressed[pyglet.window.key.LEFT] = False
         elif symbol == pyglet.window.key.RIGHT:
             self.arrow_keys_pressed[pyglet.window.key.RIGHT] = False
+    
+    def toggle_build_menu(self, show):
+        """Toggle the build menu visibility"""
+        self.build_menu_open = show
+        self.build_menu_bg.visible = show
+        self.build_menu_title.visible = show
+        self.build_menu_item1.visible = show
+        self.update_build_menu_selection()
+    
+    def select_building(self, building_id):
+        """Select a building type"""
+        if building_id in self.building_types:
+            self.selected_building = building_id
+            self.update_build_menu_selection()
+    
+    def update_build_menu_selection(self):
+        """Update the build menu to show which item is selected"""
+        # Update item 1 color based on selection
+        if self.selected_building == 1:
+            self.build_menu_item1.color = (255, 255, 0, 255)  # Yellow for selected
+        else:
+            self.build_menu_item1.color = (200, 200, 200, 255)  # Gray for unselected
+    
+    def try_build(self):
+        """Try to build the selected structure"""
+        if self.selected_building not in self.building_types:
+            return
+        
+        building = self.building_types[self.selected_building]
+        cost = building['cost']
+        resource = building['resource']
+        
+        # Check if player has enough resources
+        if resource == 'wood' and self.player.wood >= cost:
+            # Build wooden wall at player's position
+            player_center_x, player_center_y = self.player.get_center()
+            
+            # Create the wall centered on the player
+            wall = Wall(player_center_x, player_center_y, self.batch, owner=self.player)
+            self.walls.append(wall)
+            
+            # Deduct resources
+            self.player.wood -= cost
+            
+            # Wall will become solid once player moves outside it
+    
+    def update_day_night_cycle(self):
+        """Update the day/night cycle and related UI"""
+        if not self.is_night:
+            # Currently daytime
+            time_remaining = DAY_LENGTH - self.cycle_time
+            
+            # Show warning when night is approaching (last 5 seconds of day)
+            if time_remaining <= 5.0 and time_remaining > 0:
+                self.night_warning.visible = True
+                self.night_warning.text = f'NIGHT APPROACHES IN {int(time_remaining) + 1}...'
+            else:
+                self.night_warning.visible = False
+            
+            # Transition to night
+            if self.cycle_time >= DAY_LENGTH:
+                self.is_night = True
+                self.cycle_time = 0.0
+                self.night_enemies_spawned = 0
+                self.night_warning.visible = False
+                # Flash warning at start of night
+                self.night_warning.text = 'NIGHT HAS FALLEN!'
+                self.night_warning.visible = True
+                self.night_warning_timer = 2.0  # Show for 2 seconds
+            
+            # Update time label
+            mins = int(time_remaining // 60)
+            secs = int(time_remaining % 60)
+            self.time_label.text = f'Day - {mins}:{secs:02d} until night'
+            self.time_label.color = (255, 255, 150, 255)  # Light yellow
+            self.day_label.color = (255, 200, 50, 255)  # Golden yellow
+        else:
+            # Currently nighttime
+            time_remaining = NIGHT_LENGTH - self.cycle_time
+            
+            # Transition to day
+            if self.cycle_time >= NIGHT_LENGTH:
+                self.is_night = False
+                self.cycle_time = 0.0
+                self.day_count += 1
+                self.night_warning.text = 'DAWN BREAKS!'
+                self.night_warning.visible = True
+                self.night_warning_timer = 2.0  # Show for 2 seconds
+            
+            # Update time label
+            mins = int(time_remaining // 60)
+            secs = int(time_remaining % 60)
+            self.time_label.text = f'Night - {mins}:{secs:02d} until dawn'
+            self.time_label.color = (200, 100, 100, 255)  # Reddish
+            self.day_label.color = (150, 150, 200, 255)  # Pale blue
+        
+        # Update day counter
+        self.day_label.text = f'Day {self.day_count}'
+        
+        # Handle night warning timer
+        if self.night_warning_timer > 0:
+            self.night_warning_timer -= 1.0 / FPS
+            if self.night_warning_timer <= 0:
+                self.night_warning.visible = False
     
     def try_shoot(self, dt):
         """Try to shoot a projectile if fire rate allows and arrow keys are pressed"""
@@ -1255,6 +1532,10 @@ class GameWindow(pyglet.window.Window):
     def update(self, dt):
         self.frame_count += 1
         self.game_time += dt
+        
+        # Update day/night cycle
+        self.cycle_time += dt
+        self.update_day_night_cycle()
         
         # Update camera to follow player
         player_center_x, player_center_y = self.player.get_center()
@@ -1312,7 +1593,11 @@ class GameWindow(pyglet.window.Window):
                     self.enemies.append(enemy)
         
         # Update player (pass rocks and trees for collision checking)
-        self.player.update(self.keys, dt, rocks=self.rocks, trees=self.trees)
+        self.player.update(self.keys, dt, rocks=self.rocks, trees=self.trees, walls=self.walls)
+        
+        # Check if player has left any newly placed walls (make them solid)
+        for wall in self.walls:
+            wall.check_owner_outside(self.player)
         
         # Try to shoot (handles fire rate and held keys)
         self.try_shoot(dt)
@@ -1417,25 +1702,25 @@ class GameWindow(pyglet.window.Window):
             projectile.update()
             projectile.update_shape_position(self.camera)
         
-        # Enemy spawning (only host in multiplayer) - time-based for consistent spawn rate
-        if not self.is_multiplayer or (self.is_host and self.network and self.network.connected):
-            # Convert frame-based spawn rate to time-based
-            # Lower spawn_rate = faster spawning (every N frames)
-            # We'll use a time accumulator instead
-            if not hasattr(self, 'enemy_spawn_timer'):
-                self.enemy_spawn_timer = 0.0
+        # Enemy spawning (only at night, only host in multiplayer)
+        if self.is_night and (not self.is_multiplayer or (self.is_host and self.network and self.network.connected)):
+            # Calculate night difficulty based on day count
+            night_spawn_multiplier = NIGHT_SPAWN_MULTIPLIER_BASE + (self.day_count - 1) * NIGHT_SPAWN_MULTIPLIER_PER_DAY
+            night_max_enemies = NIGHT_MAX_ENEMIES_BASE + (self.day_count - 1) * NIGHT_MAX_ENEMIES_PER_DAY
+            night_max_enemies = min(night_max_enemies, MAX_ENEMIES)  # Cap at absolute max
             
-            # Calculate target spawn interval in seconds
-            frames_per_spawn = INITIAL_ENEMY_SPAWN_RATE - (self.game_time * ENEMY_SPAWN_ACCELERATION)
-            frames_per_spawn = max(MIN_ENEMY_SPAWN_RATE, frames_per_spawn)
-            spawn_interval = frames_per_spawn / FPS  # Convert frames to seconds
+            # Calculate target spawn interval in seconds (faster at night, gets faster each day)
+            base_frames_per_spawn = INITIAL_ENEMY_SPAWN_RATE - (self.cycle_time * ENEMY_SPAWN_ACCELERATION * night_spawn_multiplier)
+            frames_per_spawn = max(MIN_ENEMY_SPAWN_RATE, base_frames_per_spawn)
+            spawn_interval = frames_per_spawn / FPS / night_spawn_multiplier  # Faster spawns at night
             
             self.enemy_spawn_timer += dt
-            if len(self.enemies) < MAX_ENEMIES and self.enemy_spawn_timer >= spawn_interval:
-                # Get all obstacles for spawn validation
-                all_obstacles = list(self.rocks) + [t for t in self.trees if not t.is_chopped]
+            if len(self.enemies) < night_max_enemies and self.enemy_spawn_timer >= spawn_interval:
+                # Get all obstacles for spawn validation (including solid walls)
+                all_obstacles = list(self.rocks) + [t for t in self.trees if not t.is_chopped] + [w for w in self.walls if w.is_solid]
                 enemy = spawn_enemy(self.batch, player_center_x, player_center_y, obstacles=all_obstacles)
                 self.enemies.append(enemy)
+                self.night_enemies_spawned += 1
                 # Immediately position enemy sprite
                 enemy.update_shape_position(self.camera)
                 self.enemy_spawn_timer = 0.0
@@ -1453,7 +1738,7 @@ class GameWindow(pyglet.window.Window):
         # Pass all obstacles (rocks and non-chopped trees) for collision and pathfinding
         all_obstacles = list(self.rocks) + [t for t in self.trees if not t.is_chopped]
         for enemy in self.enemies:
-            enemy.update(player_center_x, player_center_y, dt, rocks=self.rocks, trees=self.trees)
+            enemy.update(player_center_x, player_center_y, dt, rocks=self.rocks, trees=self.trees, walls=self.walls)
             enemy.update_shape_position(self.camera)
         
         # Update rock positions
@@ -1463,6 +1748,10 @@ class GameWindow(pyglet.window.Window):
         # Update tree positions
         for tree in self.trees:
             tree.update_shape_position(self.camera)
+        
+        # Update wall positions
+        for wall in self.walls:
+            wall.update_shape_position(self.camera)
         
         # Collision detection
         enemies_to_remove = []
@@ -1489,6 +1778,14 @@ class GameWindow(pyglet.window.Window):
             if not tree.is_chopped:
                 for projectile in self.projectiles:
                     if check_collision(tree.get_rect(), projectile.get_rect()):
+                        if projectile not in projectiles_to_remove:
+                            projectiles_to_remove.append(projectile)
+        
+        # Projectiles vs walls
+        for wall in self.walls:
+            if wall.is_solid:  # Only solid walls block projectiles
+                for projectile in self.projectiles:
+                    if check_collision(wall.get_rect(), projectile.get_rect()):
                         if projectile not in projectiles_to_remove:
                             projectiles_to_remove.append(projectile)
         
@@ -1562,7 +1859,32 @@ class GameWindow(pyglet.window.Window):
             self.reload_arc_segments.append(segment)
     
     def on_draw(self):
-        gl.glClearColor(0, 0, 0, 1)
+        # Change background color based on day/night
+        if self.is_night:
+            # Night - dark blue/black
+            night_progress = self.cycle_time / NIGHT_LENGTH
+            # Darken progressively, then lighten near dawn
+            if night_progress < 0.5:
+                intensity = 0.05 - (night_progress * 0.05)  # Get darker
+            else:
+                intensity = (night_progress - 0.5) * 0.1  # Get lighter near dawn
+            gl.glClearColor(intensity * 0.3, intensity * 0.3, intensity * 0.8, 1)
+        else:
+            # Day - transitions from dark to light and back
+            day_progress = self.cycle_time / DAY_LENGTH
+            if day_progress < 0.15:
+                # Dawn - orange/yellow tint
+                intensity = 0.1 + (day_progress / 0.15) * 0.15
+                gl.glClearColor(intensity * 0.8, intensity * 0.5, intensity * 0.2, 1)
+            elif day_progress > 0.85:
+                # Dusk - orange/red tint
+                dusk_progress = (day_progress - 0.85) / 0.15
+                intensity = 0.25 - (dusk_progress * 0.15)
+                gl.glClearColor(intensity * 0.8, intensity * 0.4, intensity * 0.2, 1)
+            else:
+                # Midday - darker background (still playable)
+                gl.glClearColor(0.08, 0.08, 0.12, 1)
+        
         self.clear()
         self.batch.draw()
     
