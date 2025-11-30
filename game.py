@@ -41,7 +41,7 @@ PLAYER_HEALTH_REGEN_INTERVAL = 0.5  # Interval between health regen
 # Projectile settings
 PROJECTILE_SIZE = 10
 PROJECTILE_SPEED = 10
-PROJECTILE_FIRE_RATE = 1  # Seconds between shots (1 shots per second)
+PROJECTILE_FIRE_RATE = .5  # Seconds between shots (2 shots per second)
 
 # Enemy settings
 ENEMY_SIZE = 25
@@ -60,7 +60,7 @@ MAX_ROCKS = 50  # Generate this many rocks at game start
 # Tree settings
 TREE_SIZE = 25  # Smaller than rocks
 MAX_TREES = 80  # Generate this many trees at game start
-TREE_CHOP_TIME = 3.0  # Time in seconds to chop down a tree
+TREE_CHOP_TIME = 1.5  # Time in seconds to chop down a tree
 HARVEST_RANGE = 60
   # Distance from player center to tree center for harvesting (pixels)
 
@@ -263,7 +263,30 @@ class Projectile:
         self.dy = base_dy + velocity_per_frame_y
         
         self.batch = batch
-        self.shape = shapes.Circle(0, 0, self.size // 2, color=YELLOW, batch=batch)
+        
+        # Create layered projectile with glow effect
+        self.shapes = []
+        
+        # Outer glow
+        glow_outer = shapes.Circle(0, 0, self.size, color=(255, 200, 50), batch=batch)
+        glow_outer.opacity = 40
+        self.shapes.append(glow_outer)
+        
+        glow_mid = shapes.Circle(0, 0, self.size * 0.75, color=(255, 220, 100), batch=batch)
+        glow_mid.opacity = 80
+        self.shapes.append(glow_mid)
+        
+        # Main projectile body
+        main = shapes.Circle(0, 0, self.size // 2, color=YELLOW, batch=batch)
+        self.shapes.append(main)
+        
+        # Bright core
+        core = shapes.Circle(0, 0, self.size // 4, color=(255, 255, 200), batch=batch)
+        self.shapes.append(core)
+        
+        # White hot center
+        center = shapes.Circle(0, 0, self.size // 6, color=(255, 255, 255), batch=batch)
+        self.shapes.append(center)
     
     def update(self):
         self.x += self.dx
@@ -273,8 +296,11 @@ class Projectile:
     def update_shape_position(self, camera):
         """Update shape position based on camera"""
         screen_x, screen_y = camera.world_to_screen(self.x, self.y)
-        self.shape.x = screen_x + self.size/2
-        self.shape.y = screen_y + self.size/2
+        center_x = screen_x + self.size/2
+        center_y = screen_y + self.size/2
+        for shape in self.shapes:
+            shape.x = center_x
+            shape.y = center_y
     
     def is_off_world(self):
         """Check if projectile is outside world bounds"""
@@ -1094,25 +1120,21 @@ class GameWindow(pyglet.window.Window):
             pyglet.window.key.RIGHT: False
         }
         
-        # Reload progress bar (tiny bar at top of screen)
-        self.reload_bar_width = 100
-        self.reload_bar_height = 3
-        self.reload_bar_bg = shapes.Rectangle(
-            SCREEN_WIDTH - self.reload_bar_width - 10, 
-            SCREEN_HEIGHT - 20, 
-            self.reload_bar_width, 
-            self.reload_bar_height, 
+        # Reload progress indicator (small circle next to player)
+        self.reload_circle_radius = 5  # Very small circle
+        self.reload_circle_bg = shapes.Circle(
+            0, 0, 
+            self.reload_circle_radius, 
             color=(50, 50, 50), 
             batch=self.batch
         )
-        self.reload_bar_fg = shapes.Rectangle(
-            SCREEN_WIDTH - self.reload_bar_width - 10, 
-            SCREEN_HEIGHT - 20, 
-            0, 
-            self.reload_bar_height, 
-            color=(255, 255, 0), 
-            batch=self.batch
-        )
+        self.reload_circle_bg.opacity = 150  # Translucent
+        
+        # Arc segments for progress (using multiple small arcs)
+        self.reload_arc_segments = []  # List of arc segment shapes
+        self.reload_arc_x = 0
+        self.reload_arc_y = 0
+        self.reload_arc_progress = 0.0
         
         # Labels
         self.score_label = pyglet.text.Label(
@@ -1295,11 +1317,33 @@ class GameWindow(pyglet.window.Window):
         # Try to shoot (handles fire rate and held keys)
         self.try_shoot(dt)
         
-        # Update reload progress bar
+        # Update reload progress indicator
         current_time = self.game_time
         time_since_last_shot = current_time - self.last_fire_time
         reload_progress = min(1.0, time_since_last_shot / PROJECTILE_FIRE_RATE)
-        self.reload_bar_fg.width = self.reload_bar_width * reload_progress
+        
+        # Position reload circle at top right of player
+        player_center_x, player_center_y = self.player.get_center()
+        screen_x, screen_y = self.camera.world_to_screen(player_center_x, player_center_y)
+        # Position at top right of player cube (offset by player size/2 + small gap)
+        reload_x = screen_x + self.player.size // 2 + self.reload_circle_radius + 2
+        reload_y = screen_y + self.player.size // 2 + self.reload_circle_radius + 2
+        
+        self.reload_circle_bg.x = reload_x
+        self.reload_circle_bg.y = reload_y
+        self.reload_arc_x = reload_x
+        self.reload_arc_y = reload_y
+        self.reload_arc_progress = reload_progress
+        
+        # Update visibility
+        if reload_progress >= 1.0:
+            # Hide when fully reloaded
+            self.reload_circle_bg.visible = False
+            self._clear_reload_arc()
+        else:
+            # Show and update arc
+            self.reload_circle_bg.visible = True
+            self._update_reload_arc()
         
         # Update player sprite position (camera-based)
         self.player.update_sprite_position(self.camera)
@@ -1362,7 +1406,13 @@ class GameWindow(pyglet.window.Window):
                 tree.chop_progress = 0.0
         
         # Update projectiles
-        self.projectiles = [p for p in self.projectiles if not p.is_off_world()]
+        # Clean up projectiles that go off-world
+        for projectile in self.projectiles[:]:  # Iterate copy
+            if projectile.is_off_world():
+                for shape in projectile.shapes:
+                    shape.delete()
+                self.projectiles.remove(projectile)
+        
         for projectile in self.projectiles:
             projectile.update()
             projectile.update_shape_position(self.camera)
@@ -1450,7 +1500,8 @@ class GameWindow(pyglet.window.Window):
             enemy.border.delete()
             self.enemies.remove(enemy)
         for projectile in projectiles_to_remove:
-            projectile.shape.delete()
+            for shape in projectile.shapes:
+                shape.delete()
             self.projectiles.remove(projectile)
         
         # Check if player is hit by enemy
@@ -1466,6 +1517,49 @@ class GameWindow(pyglet.window.Window):
         
         # Update wood label
         self.wood_label.text = f"Wood: {self.player.wood}"
+    
+    def _clear_reload_arc(self):
+        """Clear all arc segments"""
+        for segment in self.reload_arc_segments:
+            segment.delete()
+        self.reload_arc_segments.clear()
+    
+    def _update_reload_arc(self):
+        """Update the reload arc using filled segments"""
+        # Clear old segments
+        self._clear_reload_arc()
+        
+        if self.reload_arc_progress <= 0:
+            return
+        
+        # Create filled arc using small filled rectangles positioned along the circle
+        # Start from top (-90 degrees) and fill clockwise
+        num_segments = max(24, int(48 * self.reload_arc_progress))  # More segments for smoother arc
+        angle_range = 2 * math.pi * self.reload_arc_progress  # Total angle to fill
+        start_angle = -math.pi / 2  # Start at top (-90 degrees)
+        
+        center_x = self.reload_arc_x
+        center_y = self.reload_arc_y
+        radius = self.reload_circle_radius
+        
+        # Create small filled rectangles along the arc path
+        for i in range(num_segments):
+            angle = start_angle + (angle_range * i / num_segments)
+            
+            # Position along the circle
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            
+            # Create a small filled rectangle (rotated to follow the arc)
+            # Use a small square that's slightly rotated
+            segment = shapes.Rectangle(
+                x - 1, y - 1,  # Small offset to center
+                2, 2,  # Small size
+                color=(255, 255, 0),
+                batch=self.batch
+            )
+            segment.opacity = 150  # Translucent
+            self.reload_arc_segments.append(segment)
     
     def on_draw(self):
         gl.glClearColor(0, 0, 0, 1)
