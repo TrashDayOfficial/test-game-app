@@ -19,14 +19,18 @@ class Entity:
     """An entity is just a unique ID with a set of components."""
     _next_id = 0
     
-    def __init__(self):
+    def __init__(self, world: 'World' = None):
         self.id = Entity._next_id
         Entity._next_id += 1
         self.components: Dict[Type, Any] = {}
         self.active = True
+        self.world = world
     
     def add_component(self, component) -> 'Entity':
-        self.components[type(component)] = component
+        comp_type = type(component)
+        self.components[comp_type] = component
+        if self.world:
+            self.world._register_component(comp_type, self)
         return self
     
     def get_component(self, component_type: Type):
@@ -40,6 +44,8 @@ class Entity:
     
     def remove_component(self, component_type: Type):
         if component_type in self.components:
+            if self.world:
+                self.world._unregister_component(component_type, self.id)
             del self.components[component_type]
 
 class World:
@@ -50,9 +56,12 @@ class World:
         self.entities_to_remove: Set[int] = set()
         self.batch = None
         self.camera = None
+        self.component_index: Dict[Type, Set[int]] = {}
+        self.spatial = None
+        self.render_resources = None
     
     def create_entity(self) -> Entity:
-        entity = Entity()
+        entity = Entity(self)
         self.entities[entity.id] = entity
         return entity
     
@@ -63,8 +72,24 @@ class World:
         return self.entities.get(entity_id)
     
     def get_entities_with(self, *component_types) -> List[Entity]:
-        return [e for e in self.entities.values() 
-                if e.active and e.has_components(*component_types)]
+        if not component_types:
+            return [e for e in self.entities.values() if e.active]
+        
+        index_sets = []
+        for comp_type in component_types:
+            entity_ids = self.component_index.get(comp_type)
+            if not entity_ids:
+                return []
+            index_sets.append(entity_ids)
+        
+        index_sets.sort(key=len)
+        common_ids = set(index_sets[0])
+        for ids in index_sets[1:]:
+            common_ids &= ids
+            if not common_ids:
+                return []
+        
+        return [self.entities[e_id] for e_id in common_ids if self.entities[e_id].active]
     
     def add_system(self, system: 'System'):
         system.world = self
@@ -85,6 +110,7 @@ class World:
                 sprite_comp = entity.get_component(SpriteComponent)
                 if sprite_comp:
                     sprite_comp.cleanup()
+                self._unregister_entity_components(entity)
                 del self.entities[entity_id]
         self.entities_to_remove.clear()
     
@@ -93,8 +119,25 @@ class World:
             sprite_comp = entity.get_component(SpriteComponent)
             if sprite_comp:
                 sprite_comp.cleanup()
+            self._unregister_entity_components(entity)
         self.entities.clear()
+        self.component_index.clear()
         Entity._next_id = 0
+    
+    def _register_component(self, comp_type: Type, entity: Entity):
+        if comp_type not in self.component_index:
+            self.component_index[comp_type] = set()
+        self.component_index[comp_type].add(entity.id)
+    
+    def _unregister_component(self, comp_type: Type, entity_id: int):
+        if comp_type in self.component_index:
+            self.component_index[comp_type].discard(entity_id)
+            if not self.component_index[comp_type]:
+                del self.component_index[comp_type]
+    
+    def _unregister_entity_components(self, entity: Entity):
+        for comp_type in list(entity.components.keys()):
+            self._unregister_component(comp_type, entity.id)
 
 class System:
     """Base class for all systems."""
@@ -269,7 +312,7 @@ DAY_LENGTH = 60.0
 NIGHT_LENGTH = 45.0
 NIGHT_SPAWN_MULTIPLIER_BASE = 1.5
 NIGHT_SPAWN_MULTIPLIER_PER_DAY = 0.3
-NIGHT_MAX_ENEMIES_BASE = 30
+NIGHT_MAX_ENEMIES_BASE = 300
 NIGHT_MAX_ENEMIES_PER_DAY = 10
 
 ROCK_MIN_SIZE = 40
@@ -335,13 +378,25 @@ def snap_to_grid(x, y):
     return grid_x, grid_y
 
 def get_entity_rect(entity: Entity):
-    """Get collision rectangle for an entity."""
+    """Get collision rectangle for an entity. Returns (x, y, width, height) where x,y is top-left."""
     pos = entity.get_component(PositionComponent)
     size = entity.get_component(SizeComponent)
     if pos and size:
         margin = size.hitbox_margin
-        return (pos.x + margin, pos.y + margin, 
-                size.width - margin * 2, size.height - margin * 2)
+        # Check if entity uses center position (trees, walls)
+        tree = entity.get_component(TreeComponent)
+        wall = entity.get_component(WallComponent)
+        if tree or wall:
+            # Position is center, convert to top-left
+            top_left_x = pos.x - size.width / 2
+            top_left_y = pos.y - size.height / 2
+            # Apply margin after conversion
+            return (top_left_x + margin, top_left_y + margin, 
+                    size.width - margin * 2, size.height - margin * 2)
+        else:
+            # Position is top-left
+            return (pos.x + margin, pos.y + margin, 
+                    size.width - margin * 2, size.height - margin * 2)
     return None
 
 def get_entity_center(entity: Entity):
@@ -349,10 +404,218 @@ def get_entity_center(entity: Entity):
     pos = entity.get_component(PositionComponent)
     size = entity.get_component(SizeComponent)
     if pos and size:
-        return (pos.x + size.width / 2, pos.y + size.height / 2)
+        # Check if entity uses center position (trees, walls)
+        tree = entity.get_component(TreeComponent)
+        wall = entity.get_component(WallComponent)
+        if tree or wall:
+            # Position is already center
+            return (pos.x, pos.y)
+        else:
+            # Position is top-left, calculate center
+            return (pos.x + size.width / 2, pos.y + size.height / 2)
     elif pos:
         return (pos.x, pos.y)
     return (0, 0)
+
+def gather_world_obstacles(world: World) -> List[Entity]:
+    """Fallback for when spatial partitioning isn't available."""
+    obstacles = []
+    for entity in world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
+        coll = entity.get_component(CollisionComponent)
+        if coll.layer != "obstacle":
+            continue
+        tree = entity.get_component(TreeComponent)
+        if tree and tree.is_chopped:
+            continue
+        wall = entity.get_component(WallComponent)
+        if wall and not wall.is_solid:
+            continue
+        obstacles.append(entity)
+    return obstacles
+
+# ============================================================================
+# SPATIAL PARTITIONING (QUADTREE)
+# ============================================================================
+
+class QuadTree:
+    """Simple quadtree for spatial partitioning."""
+    def __init__(self, bounds, level=0, max_objects=8, max_levels=6):
+        self.bounds = bounds  # (x, y, width, height)
+        self.level = level
+        self.max_objects = max_objects
+        self.max_levels = max_levels
+        self.objects: List[tuple] = []  # (rect, entity_id)
+        self.nodes: List['QuadTree'] = []
+    
+    def clear(self):
+        self.objects.clear()
+        for node in self.nodes:
+            node.clear()
+        self.nodes = []
+    
+    def split(self):
+        x, y, w, h = self.bounds
+        half_w = w / 2
+        half_h = h / 2
+        next_level = self.level + 1
+        self.nodes = [
+            QuadTree((x, y, half_w, half_h), next_level, self.max_objects, self.max_levels),  # Top-left
+            QuadTree((x + half_w, y, half_w, half_h), next_level, self.max_objects, self.max_levels),  # Top-right
+            QuadTree((x, y + half_h, half_w, half_h), next_level, self.max_objects, self.max_levels),  # Bottom-left
+            QuadTree((x + half_w, y + half_h, half_w, half_h), next_level, self.max_objects, self.max_levels),  # Bottom-right
+        ]
+    
+    def _rect_fits(self, rect, bounds):
+        rx, ry, rw, rh = rect
+        bx, by, bw, bh = bounds
+        return (rx >= bx and ry >= by and
+                rx + rw <= bx + bw and
+                ry + rh <= by + bh)
+    
+    def insert(self, rect, entity_id):
+        if self.nodes:
+            for idx, node in enumerate(self.nodes):
+                if self._rect_fits(rect, node.bounds):
+                    node.insert(rect, entity_id)
+                    return
+        
+        self.objects.append((rect, entity_id))
+        
+        if (len(self.objects) > self.max_objects) and (self.level < self.max_levels):
+            if not self.nodes:
+                self.split()
+            i = 0
+            while i < len(self.objects):
+                moved = False
+                for node in self.nodes:
+                    if self._rect_fits(self.objects[i][0], node.bounds):
+                        rect_to_move, ent_id = self.objects.pop(i)
+                        node.insert(rect_to_move, ent_id)
+                        moved = True
+                        break
+                if not moved:
+                    i += 1
+    
+    def retrieve(self, rect, results=None):
+        if results is None:
+            results = set()
+        
+        # Check objects in this node
+        for obj_rect, entity_id in self.objects:
+            if check_collision(rect, obj_rect):
+                results.add(entity_id)
+        
+        # Check child nodes if they exist and bounds intersect
+        for node in self.nodes:
+            if check_collision(rect, node.bounds):
+                node.retrieve(rect, results)
+        
+        return results
+
+
+class SpatialPartition:
+    """Manages quadtrees for different entity categories."""
+    def __init__(self, width, height):
+        bounds = (0, 0, width, height)
+        self.trees = {
+            'obstacles': QuadTree(bounds),
+            'enemies': QuadTree(bounds),
+            'projectiles': QuadTree(bounds),
+            'players': QuadTree(bounds),
+        }
+    
+    def clear_all(self):
+        for tree in self.trees.values():
+            tree.clear()
+    
+    def update_category(self, category, entities: List[Entity]):
+        tree = self.trees.get(category)
+        if not tree:
+            return
+        tree.clear()
+        for entity in entities:
+            rect = get_entity_rect(entity)
+            if rect:
+                tree.insert(rect, entity.id)
+    
+    def query(self, category, rect):
+        tree = self.trees.get(category)
+        if not tree:
+            return set()
+        return tree.retrieve(rect, set())
+
+# ============================================================================
+# RENDER RESOURCE MANAGER
+# ============================================================================
+
+class RenderResourceManager:
+    """Caches procedural textures so sprites can share image data."""
+    def __init__(self):
+        self.cache: Dict[Any, pyglet.image.ImageData] = {}
+    
+    def get_enemy_image(self):
+        key = ('enemy', ENEMY_SIZE)
+        if key not in self.cache:
+            self.cache[key] = self._create_bordered_square_image(
+                ENEMY_SIZE,
+                fill_color=RED,
+                border_color=WHITE,
+                border_thickness=2
+            )
+        return self.cache[key]
+    
+    def get_projectile_image(self):
+        key = ('projectile', PROJECTILE_SIZE)
+        if key not in self.cache:
+            self.cache[key] = self._create_radial_gradient_image(
+                PROJECTILE_SIZE,
+                inner_color=(255, 255, 200, 255),
+                outer_color=(255, 180, 30, 30)
+            )
+        return self.cache[key]
+    
+    def get_wall_image(self):
+        key = ('wall', WALL_SIZE)
+        if key not in self.cache:
+            self.cache[key] = self._create_bordered_square_image(
+                WALL_SIZE,
+                fill_color=(139, 90, 43),
+                border_color=(101, 67, 33),
+                border_thickness=2
+            )
+        return self.cache[key]
+    
+    def _create_bordered_square_image(self, size, fill_color, border_color, border_thickness):
+        data = bytearray(size * size * 4)
+        for y in range(size):
+            for x in range(size):
+                if (x < border_thickness or y < border_thickness or
+                        x >= size - border_thickness or y >= size - border_thickness):
+                    color = border_color
+                else:
+                    color = fill_color
+                idx = (y * size + x) * 4
+                data[idx] = color[0]
+                data[idx + 1] = color[1]
+                data[idx + 2] = color[2]
+                data[idx + 3] = 255
+        return pyglet.image.ImageData(size, size, 'RGBA', bytes(data))
+    
+    def _create_radial_gradient_image(self, size, inner_color, outer_color):
+        data = bytearray(size * size * 4)
+        center = (size - 1) / 2
+        max_dist = math.sqrt(2 * (center ** 2))
+        for y in range(size):
+            for x in range(size):
+                dx = x - center
+                dy = y - center
+                t = min(math.sqrt(dx * dx + dy * dy) / max_dist, 1.0)
+                idx = (y * size + x) * 4
+                data[idx] = int(inner_color[0] * (1 - t) + outer_color[0] * t)
+                data[idx + 1] = int(inner_color[1] * (1 - t) + outer_color[1] * t)
+                data[idx + 2] = int(inner_color[2] * (1 - t) + outer_color[2] * t)
+                data[idx + 3] = int(inner_color[3] * (1 - t) + outer_color[3] * t)
+        return pyglet.image.ImageData(size, size, 'RGBA', bytes(data))
 
 # ============================================================================
 # SCREEN MANAGER
@@ -419,31 +682,47 @@ class InputSystem(System):
             input_comp.harvest_pressed = self.keys[pyglet.window.key.SPACE]
 
 
+class SpatialPartitionSystem(System):
+    """Populates quadtrees for fast spatial queries."""
+    priority = 5
+    
+    def update(self, dt: float):
+        if not self.world.spatial:
+            return
+        
+        spatial = self.world.spatial
+        spatial.clear_all()
+        
+        # Obstacles (rocks, unchopped trees, solid walls)
+        obstacles = []
+        for entity in self.world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
+            coll = entity.get_component(CollisionComponent)
+            if coll.layer != "obstacle":
+                continue
+            tree = entity.get_component(TreeComponent)
+            if tree and tree.is_chopped:
+                continue
+            wall = entity.get_component(WallComponent)
+            if wall and not wall.is_solid:
+                continue
+            obstacles.append(entity)
+        spatial.update_category('obstacles', obstacles)
+        
+        # Dynamic categories
+        spatial.update_category('enemies', self.world.get_entities_with(EnemyComponent, PositionComponent, SizeComponent))
+        spatial.update_category('projectiles', self.world.get_entities_with(ProjectileComponent, PositionComponent, SizeComponent))
+        spatial.update_category('players', self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent))
+
+
 class MovementSystem(System):
     """Handles movement with collision detection."""
     priority = 10
     
     def update(self, dt: float):
-        # Get all obstacles for collision
-        obstacles = []
-        for entity in self.world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
-            coll = entity.get_component(CollisionComponent)
-            if coll.layer == "obstacle":
-                # Skip chopped trees
-                tree = entity.get_component(TreeComponent)
-                if tree and tree.is_chopped:
-                    continue
-                # Skip non-solid walls
-                wall = entity.get_component(WallComponent)
-                if wall and not wall.is_solid:
-                    continue
-                obstacles.append(entity)
-        
-        # Update players
         for entity in self.world.get_entities_with(PlayerComponent, PositionComponent, InputComponent, VelocityComponent, SizeComponent):
-            self._move_player(entity, dt, obstacles)
+            self._move_player(entity, dt)
     
-    def _move_player(self, entity: Entity, dt: float, obstacles: List[Entity]):
+    def _move_player(self, entity: Entity, dt: float):
         pos = entity.get_component(PositionComponent)
         input_comp = entity.get_component(InputComponent)
         vel = entity.get_component(VelocityComponent)
@@ -457,65 +736,129 @@ class MovementSystem(System):
         margin = size.hitbox_margin
         hitbox_size = size.width - margin * 2
         
+        # Check if player is already colliding (shouldn't happen, but safety check)
+        current_player_rect = (old_x + margin, old_y + margin, hitbox_size, hitbox_size)
+        
         can_move_x = True
         can_move_y = True
         blocking_obstacle = None
         
-        for obs in obstacles:
-            obs_pos = obs.get_component(PositionComponent)
-            obs_size = obs.get_component(SizeComponent)
-            obs_rect = (obs_pos.x, obs_pos.y, obs_size.width, obs_size.height)
-            
-            player_rect = (new_x + margin, new_y + margin, hitbox_size, hitbox_size)
-            if check_collision(player_rect, obs_rect):
-                blocking_obstacle = obs
-                test_x = (new_x + margin, old_y + margin, hitbox_size, hitbox_size)
-                test_y = (old_x + margin, new_y + margin, hitbox_size, hitbox_size)
-                
-                if check_collision(test_x, obs_rect):
-                    can_move_x = False
-                if check_collision(test_y, obs_rect):
-                    can_move_y = False
+        obstacles = []
+        if self.world.spatial:
+            query_margin = size.width * 2
+            query_rect = (
+                new_x - query_margin,
+                new_y - query_margin,
+                size.width + query_margin * 2,
+                size.height + query_margin * 2
+            )
+            for entity_id in self.world.spatial.query('obstacles', query_rect):
+                obstacle = self.world.get_entity(entity_id)
+                if obstacle:
+                    obstacles.append(obstacle)
+        else:
+            obstacles = gather_world_obstacles(self.world)
         
-        # Corner sliding
-        if blocking_obstacle and (not can_move_x or not can_move_y):
-            obs_pos = blocking_obstacle.get_component(PositionComponent)
-            obs_size = blocking_obstacle.get_component(SizeComponent)
-            obs_rect = (obs_pos.x, obs_pos.y, obs_size.width, obs_size.height)
+        # Use consistent player hitbox for all collision checks
+        player_rect_new = (new_x + margin, new_y + margin, hitbox_size, hitbox_size)
+        player_rect_old = (old_x + margin, old_y + margin, hitbox_size, hitbox_size)
+        
+        for obs in obstacles:
+            obs_rect = get_entity_rect(obs)
+            if not obs_rect:
+                continue
             
-            player_center_x = old_x + size.width / 2
-            player_center_y = old_y + size.height / 2
+            # Check collision with new position
+            if check_collision(player_rect_new, obs_rect):
+                blocking_obstacle = obs
+                # Test X-only and Y-only movement separately
+                test_x_rect = (new_x + margin, old_y + margin, hitbox_size, hitbox_size)
+                test_y_rect = (old_x + margin, new_y + margin, hitbox_size, hitbox_size)
+                
+                if check_collision(test_x_rect, obs_rect):
+                    can_move_x = False
+                if check_collision(test_y_rect, obs_rect):
+                    can_move_y = False
+                
+                # If both directions blocked, don't check other obstacles
+                if not can_move_x and not can_move_y:
+                    break
+        
+        # Improved corner sliding - only slide if very close to edge
+        if blocking_obstacle and (not can_move_x or not can_move_y):
+            obs_rect = get_entity_rect(blocking_obstacle)
+            if not obs_rect:
+                obs_rect = (0, 0, 0, 0)
+            
+            # Use hitbox centers for more accurate sliding
+            player_hitbox_center_x = old_x + margin + hitbox_size / 2
+            player_hitbox_center_y = old_y + margin + hitbox_size / 2
             obs_center_x = obs_rect[0] + obs_rect[2] / 2
             obs_center_y = obs_rect[1] + obs_rect[3] / 2
             
+            # Only slide if we're very close to an edge (reduces edge catching)
+            slide_threshold = CORNER_SLIDE_THRESHOLD
+            
             if input_comp.move_x != 0 and not can_move_x and can_move_y:
-                top_dist = abs(player_center_y - (obs_rect[1] + obs_rect[3]))
-                bot_dist = abs(player_center_y - obs_rect[1])
+                # Check distance to top and bottom edges of obstacle
+                top_edge_y = obs_rect[1] + obs_rect[3]
+                bot_edge_y = obs_rect[1]
+                top_dist = abs(player_hitbox_center_y - top_edge_y)
+                bot_dist = abs(player_hitbox_center_y - bot_edge_y)
                 
-                if top_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
-                    new_y += vel.speed * dt * 0.5
-                elif bot_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
-                    new_y -= vel.speed * dt * 0.5
+                # Only slide if within threshold
+                if top_dist < slide_threshold:
+                    slide_y = vel.speed * dt * 0.3  # Reduced slide speed
+                    # Re-check collision after slide
+                    test_slide_rect = (new_x + margin, old_y + margin + slide_y, hitbox_size, hitbox_size)
+                    if not any(check_collision(test_slide_rect, get_entity_rect(o)) for o in obstacles if o != blocking_obstacle):
+                        new_y += slide_y
+                elif bot_dist < slide_threshold:
+                    slide_y = -vel.speed * dt * 0.3
+                    test_slide_rect = (new_x + margin, old_y + margin + slide_y, hitbox_size, hitbox_size)
+                    if not any(check_collision(test_slide_rect, get_entity_rect(o)) for o in obstacles if o != blocking_obstacle):
+                        new_y += slide_y
             
             if input_comp.move_y != 0 and not can_move_y and can_move_x:
-                right_dist = abs(player_center_x - (obs_rect[0] + obs_rect[2]))
-                left_dist = abs(player_center_x - obs_rect[0])
+                # Check distance to left and right edges of obstacle
+                right_edge_x = obs_rect[0] + obs_rect[2]
+                left_edge_x = obs_rect[0]
+                right_dist = abs(player_hitbox_center_x - right_edge_x)
+                left_dist = abs(player_hitbox_center_x - left_edge_x)
                 
-                if right_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
-                    new_x += vel.speed * dt * 0.5
-                elif left_dist < CORNER_SLIDE_THRESHOLD + hitbox_size / 2:
-                    new_x -= vel.speed * dt * 0.5
+                # Only slide if within threshold
+                if right_dist < slide_threshold:
+                    slide_x = vel.speed * dt * 0.3
+                    test_slide_rect = (old_x + margin + slide_x, new_y + margin, hitbox_size, hitbox_size)
+                    if not any(check_collision(test_slide_rect, get_entity_rect(o)) for o in obstacles if o != blocking_obstacle):
+                        new_x += slide_x
+                elif left_dist < slide_threshold:
+                    slide_x = -vel.speed * dt * 0.3
+                    test_slide_rect = (old_x + margin + slide_x, new_y + margin, hitbox_size, hitbox_size)
+                    if not any(check_collision(test_slide_rect, get_entity_rect(o)) for o in obstacles if o != blocking_obstacle):
+                        new_x += slide_x
         
         # Calculate velocity for projectile inheritance
         if dt > 0:
             player.velocity_x = (new_x - old_x) / dt if can_move_x else 0
             player.velocity_y = (new_y - old_y) / dt if can_move_y else 0
         
-        # Apply movement
-        if can_move_x:
-            pos.x = new_x
-        if can_move_y:
-            pos.y = new_y
+        # Apply movement - but verify final position doesn't cause collision
+        final_x = new_x if can_move_x else old_x
+        final_y = new_y if can_move_y else old_y
+        final_player_rect = (final_x + margin, final_y + margin, hitbox_size, hitbox_size)
+        
+        # Double-check no collision at final position (prevents clipping)
+        for obs in obstacles:
+            obs_rect = get_entity_rect(obs)
+            if obs_rect and check_collision(final_player_rect, obs_rect):
+                # If we'd collide, revert to old position
+                final_x = old_x
+                final_y = old_y
+                break
+        
+        pos.x = final_x
+        pos.y = final_y
         
         # Update direction
         if input_comp.move_x != 0 or input_comp.move_y != 0:
@@ -537,7 +880,7 @@ class EnemyAISystem(System):
         for entity in self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent):
             player_entity = entity
             break
-        
+
         if not player_entity:
             return
         
@@ -546,28 +889,29 @@ class EnemyAISystem(System):
         player_x = player_pos.x + player_size.width / 2
         player_y = player_pos.y + player_size.height / 2
         
-        # Get obstacles
-        obstacles = []
-        for entity in self.world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
-            coll = entity.get_component(CollisionComponent)
-            if coll.layer == "obstacle":
-                tree = entity.get_component(TreeComponent)
-                if tree and tree.is_chopped:
-                    continue
-                wall = entity.get_component(WallComponent)
-                if wall and not wall.is_solid:
-                    continue
-                obstacles.append(entity)
-        
         # Update each enemy
         for entity in self.world.get_entities_with(EnemyComponent, PositionComponent, VelocityComponent, SizeComponent):
-            self._update_enemy(entity, player_x, player_y, dt, obstacles)
+            self._update_enemy(entity, player_x, player_y, dt)
     
-    def _update_enemy(self, entity: Entity, player_x: float, player_y: float, dt: float, obstacles: List[Entity]):
+    def _get_nearby_obstacles(self, rect):
+        if self.world.spatial:
+            obstacles = []
+            ids = self.world.spatial.query('obstacles', rect)
+            for entity_id in ids:
+                obstacle = self.world.get_entity(entity_id)
+                if obstacle:
+                    obstacles.append(obstacle)
+            return obstacles
+        return gather_world_obstacles(self.world)
+    
+    def _update_enemy(self, entity: Entity, player_x: float, player_y: float, dt: float):
         pos = entity.get_component(PositionComponent)
         vel = entity.get_component(VelocityComponent)
         size = entity.get_component(SizeComponent)
         enemy = entity.get_component(EnemyComponent)
+        entity_rect = (pos.x - ENEMY_PATHFINDING_RANGE, pos.y - ENEMY_PATHFINDING_RANGE,
+                       size.width + ENEMY_PATHFINDING_RANGE * 2, size.height + ENEMY_PATHFINDING_RANGE * 2)
+        obstacles = self._get_nearby_obstacles(entity_rect)
         
         # Find path around obstacles
         dir_x, dir_y = self._find_path(pos.x, pos.y, player_x, player_y, size.width, obstacles)
@@ -584,9 +928,9 @@ class EnemyAISystem(System):
         can_move_y = True
         
         for obs in obstacles:
-            obs_pos = obs.get_component(PositionComponent)
-            obs_size = obs.get_component(SizeComponent)
-            obs_rect = (obs_pos.x, obs_pos.y, obs_size.width, obs_size.height)
+            obs_rect = get_entity_rect(obs)
+            if not obs_rect:
+                continue
             
             if check_collision(enemy_rect, obs_rect):
                 test_x = (new_x, old_y, size.width, size.height)
@@ -606,9 +950,9 @@ class EnemyAISystem(System):
             
             can_move_perp = True
             for obs in obstacles:
-                obs_pos = obs.get_component(PositionComponent)
-                obs_size = obs.get_component(SizeComponent)
-                obs_rect = (obs_pos.x, obs_pos.y, obs_size.width, obs_size.height)
+                obs_rect = get_entity_rect(obs)
+                if not obs_rect:
+                    continue
                 if check_collision(test_rect, obs_rect):
                     can_move_perp = False
                     break
@@ -640,9 +984,9 @@ class EnemyAISystem(System):
         
         blocking = None
         for obs in obstacles:
-            obs_pos = obs.get_component(PositionComponent)
-            obs_size = obs.get_component(SizeComponent)
-            obs_rect = (obs_pos.x, obs_pos.y, obs_size.width, obs_size.height)
+            obs_rect = get_entity_rect(obs)
+            if not obs_rect:
+                continue
             if check_collision(check_rect, obs_rect):
                 blocking = obs
                 break
@@ -651,10 +995,8 @@ class EnemyAISystem(System):
             return (dir_x, dir_y)
         
         # Steer around obstacle
-        obs_pos = blocking.get_component(PositionComponent)
-        obs_size = blocking.get_component(SizeComponent)
-        obs_center_x = obs_pos.x + obs_size.width / 2
-        obs_center_y = obs_pos.y + obs_size.height / 2
+        obs_center_x, obs_center_y = get_entity_center(blocking)
+        obs_size_comp = blocking.get_component(SizeComponent)
         
         avoid_dx = x - obs_center_x
         avoid_dy = y - obs_center_y
@@ -664,7 +1006,7 @@ class EnemyAISystem(System):
             avoid_dx /= avoid_dist
             avoid_dy /= avoid_dist
             
-            obstacle_size = max(obs_size.width, obs_size.height)
+            obstacle_size = max(obs_size_comp.width, obs_size_comp.height) if obs_size_comp else size
             avoid_strength = max(0, 1.0 - (avoid_dist / (obstacle_size + size)))
             
             steer_x = dir_x * (1.0 - avoid_strength) + avoid_dx * avoid_strength
@@ -678,7 +1020,7 @@ class EnemyAISystem(System):
             return (steer_x, steer_y)
         
         return (dir_x, dir_y)
-
+    
 
 class ProjectileSystem(System):
     """Handles projectile movement and cleanup."""
@@ -710,19 +1052,8 @@ class CollisionSystem(System):
         projectiles = list(self.world.get_entities_with(ProjectileComponent, PositionComponent, SizeComponent))
         enemies = list(self.world.get_entities_with(EnemyComponent, PositionComponent, SizeComponent))
         players = list(self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent))
-        
-        # Get obstacles
-        obstacles = []
-        for entity in self.world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
-            coll = entity.get_component(CollisionComponent)
-            if coll.layer == "obstacle":
-                tree = entity.get_component(TreeComponent)
-                if tree and tree.is_chopped:
-                    continue
-                wall = entity.get_component(WallComponent)
-                if wall and not wall.is_solid:
-                    continue
-                obstacles.append(entity)
+        spatial = self.world.spatial
+        fallback_obstacles = gather_world_obstacles(self.world) if not spatial else []
         
         projectiles_to_remove = set()
         enemies_to_remove = set()
@@ -732,8 +1063,17 @@ class CollisionSystem(System):
             proj_pos = proj.get_component(PositionComponent)
             proj_size = proj.get_component(SizeComponent)
             proj_rect = (proj_pos.x, proj_pos.y, proj_size.width, proj_size.height)
+            if spatial:
+                enemy_ids = spatial.query('enemies', proj_rect)
+                nearby_enemies = []
+                for entity_id in enemy_ids:
+                    enemy_entity = self.world.get_entity(entity_id)
+                    if enemy_entity:
+                        nearby_enemies.append(enemy_entity)
+            else:
+                nearby_enemies = enemies
             
-            for enemy in enemies:
+            for enemy in nearby_enemies:
                 enemy_pos = enemy.get_component(PositionComponent)
                 enemy_size = enemy.get_component(SizeComponent)
                 enemy_rect = (enemy_pos.x, enemy_pos.y, enemy_size.width, enemy_size.height)
@@ -753,16 +1093,21 @@ class CollisionSystem(System):
             proj_pos = proj.get_component(PositionComponent)
             proj_size = proj.get_component(SizeComponent)
             proj_rect = (proj_pos.x, proj_pos.y, proj_size.width, proj_size.height)
+            nearby_obstacles = fallback_obstacles
+            if spatial:
+                ids = spatial.query('obstacles', proj_rect)
+                nearby_obstacles = []
+                for entity_id in ids:
+                    obstacle = self.world.get_entity(entity_id)
+                    if obstacle:
+                        nearby_obstacles.append(obstacle)
             
-            for obs in obstacles:
-                obs_pos = obs.get_component(PositionComponent)
-                obs_size = obs.get_component(SizeComponent)
-                obs_rect = (obs_pos.x, obs_pos.y, obs_size.width, obs_size.height)
-                
-                if check_collision(proj_rect, obs_rect):
+            for obs in nearby_obstacles:
+                obs_rect = get_entity_rect(obs)
+                if obs_rect and check_collision(proj_rect, obs_rect):
                     projectiles_to_remove.add(proj.id)
-                    break
-        
+                break
+                    
         # Enemy vs Player
         for player in players:
             player_pos = player.get_component(PositionComponent)
@@ -771,7 +1116,17 @@ class CollisionSystem(System):
             player_rect = (player_pos.x + margin, player_pos.y + margin,
                           player_size.width - margin * 2, player_size.height - margin * 2)
             
-            for enemy in enemies:
+            if spatial:
+                enemy_ids = spatial.query('enemies', player_rect)
+                nearby_enemies = []
+                for entity_id in enemy_ids:
+                    enemy_entity = self.world.get_entity(entity_id)
+                    if enemy_entity:
+                        nearby_enemies.append(enemy_entity)
+            else:
+                nearby_enemies = enemies
+            
+            for enemy in nearby_enemies:
                 if enemy.id in enemies_to_remove:
                     continue
                 enemy_pos = enemy.get_component(PositionComponent)
@@ -814,7 +1169,7 @@ class HarvestSystem(System):
         player_center_y = player_pos.y + player_size.height / 2
         
         # Find nearby tree
-        nearby_tree = None
+        nearby_tree_id = None
         min_dist = float('inf')
         
         if input_comp.harvest_pressed:
@@ -824,9 +1179,9 @@ class HarvestSystem(System):
                     continue
                 
                 tree_pos = entity.get_component(PositionComponent)
-                tree_size = entity.get_component(SizeComponent)
-                tree_center_x = tree_pos.x + tree_size.width / 2
-                tree_center_y = tree_pos.y + tree_size.height / 2
+                # Tree position is stored as center
+                tree_center_x = tree_pos.x
+                tree_center_y = tree_pos.y
                 
                 dx = player_center_x - tree_center_x
                 dy = player_center_y - tree_center_y
@@ -834,13 +1189,17 @@ class HarvestSystem(System):
                 
                 if distance <= HARVEST_RANGE and distance < min_dist:
                     min_dist = distance
-                    nearby_tree = entity
+                    nearby_tree_id = entity.id
         
         # Update all trees
-        for entity in self.world.get_entities_with(TreeComponent, PositionComponent):
+        for entity in self.world.get_entities_with(TreeComponent, PositionComponent, SizeComponent):
             tree = entity.get_component(TreeComponent)
             
-            if entity == nearby_tree and input_comp.harvest_pressed:
+            # Skip already chopped trees
+            if tree.is_chopped:
+                continue
+            
+            if entity.id == nearby_tree_id and input_comp.harvest_pressed:
                 tree.current_chopper = player_entity.id
                 tree.chop_progress += dt / TREE_CHOP_TIME
                 
@@ -852,9 +1211,11 @@ class HarvestSystem(System):
                     if sprite:
                         sprite.cleanup()
                     self.world.remove_entity(entity.id)
-            else:
-                tree.current_chopper = None
-                tree.chop_progress = 0.0
+        else:
+                # Only reset if this tree was being chopped by this player
+                if tree.current_chopper == player_entity.id:
+                    tree.current_chopper = None
+                    tree.chop_progress = 0.0
 
 
 class WallSystem(System):
@@ -867,7 +1228,7 @@ class WallSystem(System):
         for entity in self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent):
             player_entity = entity
             break
-        
+                
         if not player_entity:
             return
         
@@ -900,6 +1261,11 @@ class RenderSystem(System):
             pos = entity.get_component(PositionComponent)
             sprite_comp = entity.get_component(SpriteComponent)
             size = entity.get_component(SizeComponent)
+            tree = entity.get_component(TreeComponent)
+            rock = entity.get_component(RockComponent)
+            wall = entity.get_component(WallComponent)
+            enemy = entity.get_component(EnemyComponent)
+            proj = entity.get_component(ProjectileComponent)
             
             if not sprite_comp.visible:
                 continue
@@ -908,26 +1274,37 @@ class RenderSystem(System):
             
             # Handle player/enemy sprites
             if sprite_comp.sprite:
+                offset_x = 0
+                offset_y = 0
+                if (tree or wall) and size:
+                    offset_x = -size.width / 2
+                    offset_y = -size.height / 2
                 sprite_comp.sprite.x = screen_x
                 sprite_comp.sprite.y = screen_y
+                if offset_x or offset_y:
+                    sprite_comp.sprite.x += offset_x
+                    sprite_comp.sprite.y += offset_y
             
             # Handle shape-based entities
-            tree = entity.get_component(TreeComponent)
             if tree and not tree.is_chopped:
+                size_comp = entity.get_component(SizeComponent)
+                # Tree position is center, convert to top-left for rendering
+                tree_top_left_x = screen_x - size_comp.width / 2
+                tree_top_left_y = screen_y - size_comp.height / 2
+                
                 if len(sprite_comp.shapes) >= 2:
-                    # Trunk
-                    size_comp = entity.get_component(SizeComponent)
-                    sprite_comp.shapes[0].x = screen_x + size_comp.width / 2 - size_comp.width // 6
-                    sprite_comp.shapes[0].y = screen_y
-                    # Leaves
-                    sprite_comp.shapes[1].x = screen_x + size_comp.width / 2
-                    sprite_comp.shapes[1].y = screen_y + size_comp.height + size_comp.height // 3
+                    # Trunk (centered horizontally, at bottom)
+                    sprite_comp.shapes[0].x = tree_top_left_x + size_comp.width / 2 - size_comp.width // 6
+                    sprite_comp.shapes[0].y = tree_top_left_y
+                    # Leaves (centered horizontally, above trunk)
+                    sprite_comp.shapes[1].x = tree_top_left_x + size_comp.width / 2
+                    sprite_comp.shapes[1].y = tree_top_left_y + size_comp.height + size_comp.height // 3
                 
                 # Update progress bar
                 if sprite_comp.progress_bar_bg and sprite_comp.progress_bar_fg:
-                    bar_width = (size.width if size else TREE_SIZE) + 10
-                    sprite_comp.progress_bar_bg.x = screen_x + (size.width if size else TREE_SIZE) / 2 - bar_width // 2
-                    sprite_comp.progress_bar_bg.y = screen_y + (size.height if size else TREE_SIZE) + 10
+                    bar_width = size_comp.width + 10
+                    sprite_comp.progress_bar_bg.x = tree_top_left_x + size_comp.width / 2 - bar_width // 2
+                    sprite_comp.progress_bar_bg.y = tree_top_left_y + size_comp.height + 10
                     sprite_comp.progress_bar_fg.x = sprite_comp.progress_bar_bg.x
                     sprite_comp.progress_bar_fg.y = sprite_comp.progress_bar_bg.y
                     
@@ -935,19 +1312,17 @@ class RenderSystem(System):
                         sprite_comp.progress_bar_bg.visible = True
                         sprite_comp.progress_bar_fg.visible = True
                         sprite_comp.progress_bar_fg.width = bar_width * tree.chop_progress
-                    else:
-                        sprite_comp.progress_bar_bg.visible = False
-                        sprite_comp.progress_bar_fg.visible = False
+                else:
+                    sprite_comp.progress_bar_bg.visible = False
+                    sprite_comp.progress_bar_fg.visible = False
                 continue
             
-            rock = entity.get_component(RockComponent)
             if rock:
                 for shape in sprite_comp.shapes:
                     shape.x = screen_x
                     shape.y = screen_y
                 continue
             
-            wall = entity.get_component(WallComponent)
             if wall:
                 size_comp = entity.get_component(SizeComponent)
                 half_w = size_comp.width // 2
@@ -968,15 +1343,13 @@ class RenderSystem(System):
                     sprite_comp.shapes[4].y = actual_y + 3 * size_comp.height // 4
                 continue
             
-            enemy = entity.get_component(EnemyComponent)
-            if enemy:
+            if enemy and sprite_comp.shapes and not sprite_comp.sprite:
                 for shape in sprite_comp.shapes:
                     shape.x = screen_x
                     shape.y = screen_y
                 continue
             
-            proj = entity.get_component(ProjectileComponent)
-            if proj:
+            if proj and sprite_comp.shapes and not sprite_comp.sprite:
                 center_x = screen_x + (size.width if size else PROJECTILE_SIZE) / 2
                 center_y = screen_y + (size.height if size else PROJECTILE_SIZE) / 2
                 for shape in sprite_comp.shapes:
@@ -1023,10 +1396,14 @@ def create_enemy(world: World, x: float, y: float, enemy_id: int = None) -> Enti
     entity.add_component(TagComponent(tags={"enemy"}))
     
     sprite_comp = SpriteComponent()
-    sprite_comp.add_shape(shapes.Rectangle(0, 0, ENEMY_SIZE, ENEMY_SIZE, color=RED, batch=world.batch))
-    border = shapes.Rectangle(0, 0, ENEMY_SIZE, ENEMY_SIZE, color=WHITE, batch=world.batch)
-    border.opacity = 128
-    sprite_comp.add_shape(border)
+    if world.render_resources:
+        image = world.render_resources.get_enemy_image()
+        sprite_comp.sprite = pyglet.sprite.Sprite(image, batch=world.batch)
+    if not sprite_comp.sprite:
+        sprite_comp.add_shape(shapes.Rectangle(0, 0, ENEMY_SIZE, ENEMY_SIZE, color=RED, batch=world.batch))
+        border = shapes.Rectangle(0, 0, ENEMY_SIZE, ENEMY_SIZE, color=WHITE, batch=world.batch)
+        border.opacity = 128
+        sprite_comp.add_shape(border)
     entity.add_component(sprite_comp)
     
     return entity
@@ -1057,20 +1434,11 @@ def create_projectile(world: World, x: float, y: float, direction_x: float, dire
     entity.add_component(TagComponent(tags={"projectile"}))
     
     sprite_comp = SpriteComponent()
-    # Outer glow
-    glow_outer = shapes.Circle(0, 0, PROJECTILE_SIZE, color=(255, 200, 50), batch=world.batch)
-    glow_outer.opacity = 40
-    sprite_comp.add_shape(glow_outer)
-    # Mid glow
-    glow_mid = shapes.Circle(0, 0, PROJECTILE_SIZE * 0.75, color=(255, 220, 100), batch=world.batch)
-    glow_mid.opacity = 80
-    sprite_comp.add_shape(glow_mid)
-    # Main body
-    sprite_comp.add_shape(shapes.Circle(0, 0, PROJECTILE_SIZE // 2, color=YELLOW, batch=world.batch))
-    # Bright core
-    sprite_comp.add_shape(shapes.Circle(0, 0, PROJECTILE_SIZE // 4, color=(255, 255, 200), batch=world.batch))
-    # White center
-    sprite_comp.add_shape(shapes.Circle(0, 0, PROJECTILE_SIZE // 6, color=(255, 255, 255), batch=world.batch))
+    if world.render_resources:
+        image = world.render_resources.get_projectile_image()
+        sprite_comp.sprite = pyglet.sprite.Sprite(image, batch=world.batch)
+    if not sprite_comp.sprite:
+        sprite_comp.add_shape(shapes.Circle(0, 0, PROJECTILE_SIZE // 2, color=YELLOW, batch=world.batch))
     entity.add_component(sprite_comp)
     
     return entity
@@ -1095,10 +1463,10 @@ def create_rock(world: World, x: float, y: float, size: int) -> Entity:
     return entity
 
 def create_tree(world: World, x: float, y: float, tree_id: int = None) -> Entity:
-    """Create a tree entity."""
+    """Create a tree entity. x, y are center coordinates."""
     entity = world.create_entity()
     
-    entity.add_component(PositionComponent(x=x - TREE_SIZE // 2, y=y - TREE_SIZE // 2))
+    entity.add_component(PositionComponent(x=x, y=y))
     entity.add_component(SizeComponent(width=TREE_SIZE, height=TREE_SIZE))
     entity.add_component(TreeComponent(tree_id=tree_id or random.randint(2000, 9999)))
     entity.add_component(CollisionComponent(layer="obstacle", collides_with=["player", "enemy", "projectile"]))
@@ -1130,14 +1498,17 @@ def create_wall(world: World, x: float, y: float, owner_id: int = None) -> Entit
     entity.add_component(TagComponent(tags={"wall", "obstacle"}))
     
     sprite_comp = SpriteComponent()
-    sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE, WALL_SIZE, color=(139, 90, 43), batch=world.batch))
-    border = shapes.Rectangle(0, 0, WALL_SIZE, WALL_SIZE, color=(101, 67, 33), batch=world.batch)
-    border.opacity = 200
-    sprite_comp.add_shape(border)
-    # Grain lines
-    sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
-    sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
-    sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
+    if world.render_resources:
+        image = world.render_resources.get_wall_image()
+        sprite_comp.sprite = pyglet.sprite.Sprite(image, batch=world.batch)
+    else:
+        sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE, WALL_SIZE, color=(139, 90, 43), batch=world.batch))
+        border = shapes.Rectangle(0, 0, WALL_SIZE, WALL_SIZE, color=(101, 67, 33), batch=world.batch)
+        border.opacity = 200
+        sprite_comp.add_shape(border)
+        sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
+        sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
+        sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
     entity.add_component(sprite_comp)
     
     return entity
@@ -1221,21 +1592,20 @@ def generate_trees_ecs(world: World, num_trees: int, exclude_x=None, exclude_y=N
             if dist < exclude_radius:
                 continue
         
+        # x, y are center coordinates, create rect for overlap checking
         new_rect = (x - TREE_SIZE // 2, y - TREE_SIZE // 2, TREE_SIZE, TREE_SIZE)
         overlap = False
         
         for existing in trees:
-            pos = existing.get_component(PositionComponent)
-            sz = existing.get_component(SizeComponent)
-            if check_collision(new_rect, (pos.x, pos.y, sz.width, sz.height)):
+            existing_rect = get_entity_rect(existing)
+            if existing_rect and check_collision(new_rect, existing_rect):
                 overlap = True
                 break
         
         if not overlap:
             for rock in existing_rocks:
-                pos = rock.get_component(PositionComponent)
-                sz = rock.get_component(SizeComponent)
-                if check_collision(new_rect, (pos.x, pos.y, sz.width, sz.height)):
+                rock_rect = get_entity_rect(rock)
+                if rock_rect and check_collision(new_rect, rock_rect):
                     overlap = True
                     break
         
@@ -1636,6 +2006,8 @@ class GameWindow(pyglet.window.Window):
         self.world = World()
         self.world.batch = self.batch
         self.world.camera = Camera()
+        self.world.spatial = SpatialPartition(WORLD_WIDTH, WORLD_HEIGHT)
+        self.world.render_resources = RenderResourceManager()
         
         # Network setup
         self.network = None
@@ -1685,6 +2057,7 @@ class GameWindow(pyglet.window.Window):
         
         # Add ECS Systems
         self.world.add_system(InputSystem(self.keys, self.arrow_keys_pressed))
+        self.world.add_system(SpatialPartitionSystem())
         self.world.add_system(MovementSystem())
         self.world.add_system(EnemyAISystem())
         self.world.add_system(ProjectileSystem())
@@ -1703,9 +2076,13 @@ class GameWindow(pyglet.window.Window):
         self.day_count = 1
         self.is_night = False
         self.cycle_time = 0.0
+        # Cached lighting color for smooth transitions
+        self.current_bg_color = [0.08, 0.08, 0.12, 1.0]  # Use list for mutable interpolation
+        self.target_bg_color = [0.08, 0.08, 0.12, 1.0]
         
         # Build mode
         self.build_menu_open = False
+        self.build_menu_last_used = 0.0
         self.selected_building = 1
         self.building_types = {1: {'name': 'Wooden Wall', 'cost': WALL_WOOD_COST, 'resource': 'wood'}}
         
@@ -1765,8 +2142,8 @@ class GameWindow(pyglet.window.Window):
         self.wood_ring2 = shapes.Circle(log_x + 7, log_y - 1, 2, color=(101, 67, 33), batch=self.batch)
         self.wood_label = pyglet.text.Label('0', font_name='Arial', font_size=16, x=30, y=log_y - 6, anchor_y='center', color=WHITE, batch=self.batch)
         
-        # Coin icon and counter
-        coin_y = SCREEN_HEIGHT - 40
+        # Coin icon and counter (moved down to avoid overlap with wood)
+        coin_y = SCREEN_HEIGHT - 50  # Increased gap from 20 to 30 pixels
         self.coin_icon = shapes.Circle(16, coin_y, 8, color=(255, 215, 0), batch=self.batch)
         self.coin_highlight = shapes.Circle(16, coin_y, 5, color=(255, 235, 100), batch=self.batch)
         self.coin_label = pyglet.text.Label('0', font_name='Arial', font_size=16, x=30, y=coin_y, anchor_y='center', color=WHITE, batch=self.batch)
@@ -1843,6 +2220,8 @@ class GameWindow(pyglet.window.Window):
     
     def toggle_build_menu(self, show):
         self.build_menu_open = show
+        if show:
+            self.build_menu_last_used = self.game_time
         self.build_menu_bg.visible = show
         self.build_menu_title.visible = show
         self.build_menu_item1.visible = show
@@ -1850,10 +2229,13 @@ class GameWindow(pyglet.window.Window):
     def select_building(self, building_id):
         if building_id in self.building_types:
             self.selected_building = building_id
+            self.build_menu_last_used = self.game_time
     
     def try_build(self):
         if self.selected_building not in self.building_types:
             return
+        
+        self.build_menu_last_used = self.game_time
         
         building = self.building_types[self.selected_building]
         cost = building['cost']
@@ -1982,6 +2364,7 @@ class GameWindow(pyglet.window.Window):
         self.game_time += dt
         self.cycle_time += dt
         self.update_day_night_cycle()
+        self._update_lighting(dt)  # Update lighting smoothly
         
         # Update camera to follow player
         player_pos = self.player_entity.get_component(PositionComponent)
@@ -2022,6 +2405,10 @@ class GameWindow(pyglet.window.Window):
         
         # Try to shoot
         self.try_shoot(dt)
+        
+        # Auto-hide build menu after inactivity
+        if self.build_menu_open and (self.game_time - self.build_menu_last_used) > 3.0:
+            self.toggle_build_menu(False)
         
         # Enemy spawning (only at night)
         if self.is_night and (not self.is_multiplayer or (self.is_host and self.network and self.network.connected)):
@@ -2098,26 +2485,40 @@ class GameWindow(pyglet.window.Window):
             segment.opacity = 150
             self.reload_arc_segments.append(segment)
     
-    def on_draw(self):
+    def _update_lighting(self, dt):
+        """Update lighting color smoothly with interpolation."""
+        # Calculate target color based on current cycle state
         if self.is_night:
             night_progress = self.cycle_time / NIGHT_LENGTH
             if night_progress < 0.5:
+                # Getting darker
                 intensity = 0.05 - (night_progress * 0.05)
             else:
+                # Getting lighter near dawn
                 intensity = (night_progress - 0.5) * 0.1
-            gl.glClearColor(intensity * 0.3, intensity * 0.3, intensity * 0.8, 1)
+            self.target_bg_color = [intensity * 0.3, intensity * 0.3, intensity * 0.8, 1.0]
         else:
             day_progress = self.cycle_time / DAY_LENGTH
             if day_progress < 0.15:
+                # Dawn - orange/yellow tint
                 intensity = 0.1 + (day_progress / 0.15) * 0.15
-                gl.glClearColor(intensity * 0.8, intensity * 0.5, intensity * 0.2, 1)
+                self.target_bg_color = [intensity * 0.8, intensity * 0.5, intensity * 0.2, 1.0]
             elif day_progress > 0.85:
+                # Dusk - orange/red tint
                 dusk_progress = (day_progress - 0.85) / 0.15
                 intensity = 0.25 - (dusk_progress * 0.15)
-                gl.glClearColor(intensity * 0.8, intensity * 0.4, intensity * 0.2, 1)
+                self.target_bg_color = [intensity * 0.8, intensity * 0.4, intensity * 0.2, 1.0]
             else:
-                gl.glClearColor(0.08, 0.08, 0.12, 1)
+                # Midday
+                self.target_bg_color = [0.08, 0.08, 0.12, 1.0]
         
+        # Smoothly interpolate current color towards target (lerp factor controls smoothness)
+        lerp_factor = min(1.0, dt * 2.0)  # Adjust multiplier for transition speed (2.0 = ~0.5s transition)
+        for i in range(4):
+            self.current_bg_color[i] = self.current_bg_color[i] + (self.target_bg_color[i] - self.current_bg_color[i]) * lerp_factor
+    
+    def on_draw(self):
+        gl.glClearColor(*self.current_bg_color)
         self.clear()
         self.batch.draw()
     
