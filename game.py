@@ -904,6 +904,24 @@ class EnemyAISystem(System):
             return obstacles
         return gather_world_obstacles(self.world)
     
+    def _get_nearby_enemies(self, rect, exclude_entity_id):
+        """Get nearby enemies excluding the current entity."""
+        if self.world.spatial:
+            enemies = []
+            ids = self.world.spatial.query('enemies', rect)
+            for entity_id in ids:
+                if entity_id != exclude_entity_id:
+                    enemy = self.world.get_entity(entity_id)
+                    if enemy:
+                        enemies.append(enemy)
+            return enemies
+        # Fallback: get all enemies
+        enemies = []
+        for e in self.world.get_entities_with(EnemyComponent, PositionComponent, SizeComponent):
+            if e.id != exclude_entity_id:
+                enemies.append(e)
+        return enemies
+    
     def _update_enemy(self, entity: Entity, player_x: float, player_y: float, dt: float):
         pos = entity.get_component(PositionComponent)
         vel = entity.get_component(VelocityComponent)
@@ -912,6 +930,9 @@ class EnemyAISystem(System):
         entity_rect = (pos.x - ENEMY_PATHFINDING_RANGE, pos.y - ENEMY_PATHFINDING_RANGE,
                        size.width + ENEMY_PATHFINDING_RANGE * 2, size.height + ENEMY_PATHFINDING_RANGE * 2)
         obstacles = self._get_nearby_obstacles(entity_rect)
+        
+        # Get nearby enemies for collision
+        nearby_enemies = self._get_nearby_enemies(entity_rect, entity.id)
         
         # Find path around obstacles
         dir_x, dir_y = self._find_path(pos.x, pos.y, player_x, player_y, size.width, obstacles)
@@ -922,7 +943,7 @@ class EnemyAISystem(System):
         
         old_x, old_y = pos.x, pos.y
         
-        # Check collision
+        # Check collision with obstacles
         enemy_rect = (new_x, new_y, size.width, size.height)
         can_move_x = True
         can_move_y = True
@@ -941,6 +962,21 @@ class EnemyAISystem(System):
                 if check_collision(test_y, obs_rect):
                     can_move_y = False
         
+        # Check collision with other enemies
+        for other_enemy in nearby_enemies:
+            other_pos = other_enemy.get_component(PositionComponent)
+            other_size = other_enemy.get_component(SizeComponent)
+            other_rect = (other_pos.x, other_pos.y, other_size.width, other_size.height)
+            
+            if check_collision(enemy_rect, other_rect):
+                test_x = (new_x, old_y, size.width, size.height)
+                test_y = (old_x, new_y, size.width, size.height)
+                
+                if check_collision(test_x, other_rect):
+                    can_move_x = False
+                if check_collision(test_y, other_rect):
+                    can_move_y = False
+        
         # Try perpendicular movement if blocked
         if not can_move_x and not can_move_y:
             perp_x, perp_y = -dir_y, dir_x
@@ -956,6 +992,16 @@ class EnemyAISystem(System):
                 if check_collision(test_rect, obs_rect):
                     can_move_perp = False
                     break
+            
+            # Also check perpendicular movement against other enemies
+            if can_move_perp:
+                for other_enemy in nearby_enemies:
+                    other_pos = other_enemy.get_component(PositionComponent)
+                    other_size = other_enemy.get_component(SizeComponent)
+                    other_rect = (other_pos.x, other_pos.y, other_size.width, other_size.height)
+                    if check_collision(test_rect, other_rect):
+                        can_move_perp = False
+                        break
             
             if can_move_perp:
                 pos.x = test_new_x
