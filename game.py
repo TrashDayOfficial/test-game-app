@@ -189,6 +189,7 @@ class InputComponent:
     shoot_y: int = 0
     harvest_pressed: bool = False
     build_pressed: bool = False
+    interact_pressed: bool = False
 
 @dataclass
 class EnemyComponent:
@@ -217,6 +218,24 @@ class RockComponent:
 class WallComponent:
     owner_id: Optional[int] = None
     is_solid: bool = False
+
+@dataclass
+class DoorComponent:
+    owner_id: Optional[int] = None
+    is_open: bool = False
+    is_blocking: bool = False  # Like walls, starts non-blocking when built
+
+@dataclass
+class StairsComponent:
+    owner_id: Optional[int] = None
+    direction_x: float = 0.0  # Direction towards higher level
+    direction_y: float = 0.0
+    from_level: int = 0  # Level stairs start from
+    to_level: int = 1    # Level stairs go to
+
+@dataclass
+class HeightComponent:
+    level: int = 0  # Height level (0 = ground, 1+ = higher)
 
 @dataclass
 class CollisionComponent:
@@ -430,6 +449,11 @@ def gather_world_obstacles(world: World) -> List[Entity]:
         wall = entity.get_component(WallComponent)
         if wall and not wall.is_solid:
             continue
+        door = entity.get_component(DoorComponent)
+        if door:
+            # Doors only block if they're closed AND blocking (player has moved away)
+            if door.is_open or not door.is_blocking:
+                continue
         obstacles.append(entity)
     return obstacles
 
@@ -680,6 +704,9 @@ class InputSystem(System):
             
             # Harvest input
             input_comp.harvest_pressed = self.keys[pyglet.window.key.SPACE]
+            
+            # Interact input (spacebar also used for interaction)
+            input_comp.interact_pressed = self.keys[pyglet.window.key.SPACE]
 
 
 class SpatialPartitionSystem(System):
@@ -693,7 +720,7 @@ class SpatialPartitionSystem(System):
         spatial = self.world.spatial
         spatial.clear_all()
         
-        # Obstacles (rocks, unchopped trees, solid walls)
+        # Obstacles (rocks, unchopped trees, solid walls, closed doors)
         obstacles = []
         for entity in self.world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
             coll = entity.get_component(CollisionComponent)
@@ -705,6 +732,11 @@ class SpatialPartitionSystem(System):
             wall = entity.get_component(WallComponent)
             if wall and not wall.is_solid:
                 continue
+            door = entity.get_component(DoorComponent)
+            if door:
+                # Doors only block if they're closed AND blocking (player has moved away)
+                if door.is_open or not door.is_blocking:
+                    continue
             obstacles.append(entity)
         spatial.update_category('obstacles', obstacles)
         
@@ -730,8 +762,17 @@ class MovementSystem(System):
         player = entity.get_component(PlayerComponent)
         
         old_x, old_y = pos.x, pos.y
-        new_x = pos.x + input_comp.move_x * vel.speed * dt
-        new_y = pos.y + input_comp.move_y * vel.speed * dt
+        
+        # Normalize movement vector so diagonal movement is same speed
+        move_x = input_comp.move_x
+        move_y = input_comp.move_y
+        move_length = math.sqrt(move_x**2 + move_y**2)
+        if move_length > 0:
+            move_x = move_x / move_length
+            move_y = move_y / move_length
+        
+        new_x = pos.x + move_x * vel.speed * dt
+        new_y = pos.y + move_y * vel.speed * dt
         
         margin = size.hitbox_margin
         hitbox_size = size.width - margin * 2
@@ -1125,12 +1166,40 @@ class CollisionSystem(System):
                 enemy_rect = (enemy_pos.x, enemy_pos.y, enemy_size.width, enemy_size.height)
                 
                 if check_collision(proj_rect, enemy_rect):
-                    projectiles_to_remove.add(proj.id)
-                    enemies_to_remove.add(enemy.id)
-                    # Award coins to player
-                    if players:
-                        player_comp = players[0].get_component(PlayerComponent)
-                        player_comp.coins += 1
+                    # Check height: player can only shoot enemies if player is exactly 1 level higher
+                    proj_owner = proj.get_component(ProjectileComponent)
+                    if proj_owner and proj_owner.owner_id:
+                        # Find player who shot
+                        shooter_height = None
+                        for player in players:
+                            player_comp = player.get_component(PlayerComponent)
+                            if player_comp.player_id == proj_owner.owner_id:
+                                shooter_height = player.get_component(HeightComponent)
+                                break
+                        
+                        if shooter_height:
+                            enemy_height = enemy.get_component(HeightComponent)
+                            if enemy_height and shooter_height.level - enemy_height.level == 1:
+                                projectiles_to_remove.add(proj.id)
+                                enemies_to_remove.add(enemy.id)
+                                # Award coins to player
+                                if players:
+                                    player_comp = players[0].get_component(PlayerComponent)
+                                    player_comp.coins += 1
+                        else:
+                            # No height check if shooter not found (fallback)
+                            projectiles_to_remove.add(proj.id)
+                            enemies_to_remove.add(enemy.id)
+                            if players:
+                                player_comp = players[0].get_component(PlayerComponent)
+                                player_comp.coins += 1
+                    else:
+                        # No owner info, allow hit (fallback)
+                        projectiles_to_remove.add(proj.id)
+                        enemies_to_remove.add(enemy.id)
+                        if players:
+                            player_comp = players[0].get_component(PlayerComponent)
+                            player_comp.coins += 1
         
         # Projectile vs Obstacles
         for proj in projectiles:
@@ -1180,6 +1249,14 @@ class CollisionSystem(System):
                 enemy_rect = (enemy_pos.x, enemy_pos.y, enemy_size.width, enemy_size.height)
                 
                 if check_collision(player_rect, enemy_rect):
+                    # Check height: enemies can't hurt players that are higher than them
+                    player_height = player.get_component(HeightComponent)
+                    enemy_height = enemy.get_component(HeightComponent)
+                    
+                    if player_height and enemy_height:
+                        if player_height.level > enemy_height.level:
+                            continue  # Player is higher, enemy can't hurt
+                    
                     # Game over
                     if self.game_window:
                         self.game_window.show_game_over()
@@ -1190,6 +1267,216 @@ class CollisionSystem(System):
             self.world.remove_entity(entity_id)
         for entity_id in enemies_to_remove:
             self.world.remove_entity(entity_id)
+
+
+class InteractionSystem(System):
+    """Handles door interactions."""
+    priority = 24
+    
+    def __init__(self, game_window):
+        super().__init__()
+        self.game_window = game_window
+        self.interact_range = 60  # Same as harvest range
+        self.nearby_door = None
+        self.tooltip_text = None
+        self.last_interact_pressed = False  # Track previous frame's state for edge detection
+    
+    def update(self, dt: float):
+        # Get player
+        player_entity = None
+        for entity in self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent, InputComponent):
+            player_entity = entity
+            break
+        
+        if not player_entity:
+            self.nearby_door = None
+            if self.tooltip_text:
+                self.tooltip_text.visible = False
+            return
+        
+        player_pos = player_entity.get_component(PositionComponent)
+        player_size = player_entity.get_component(SizeComponent)
+        input_comp = player_entity.get_component(InputComponent)
+        
+        player_center_x = player_pos.x + player_size.width / 2
+        player_center_y = player_pos.y + player_size.height / 2
+        
+        # Find nearby door
+        nearby_door = None
+        min_dist = float('inf')
+        
+        for entity in self.world.get_entities_with(DoorComponent, PositionComponent, SizeComponent):
+            door_pos = entity.get_component(PositionComponent)
+            door_center_x = door_pos.x
+            door_center_y = door_pos.y
+            
+            dx = player_center_x - door_center_x
+            dy = player_center_y - door_center_y
+            distance = math.sqrt(dx**2 + dy**2)
+            
+            if distance <= self.interact_range and distance < min_dist:
+                min_dist = distance
+                nearby_door = entity
+        
+        self.nearby_door = nearby_door
+        
+        # Handle interaction - only on edge (press, not hold)
+        interact_just_pressed = input_comp.interact_pressed and not self.last_interact_pressed
+        self.last_interact_pressed = input_comp.interact_pressed
+        
+        if nearby_door and interact_just_pressed:
+            door = nearby_door.get_component(DoorComponent)
+            door_pos = nearby_door.get_component(PositionComponent)
+            door_size = nearby_door.get_component(SizeComponent)
+            
+            # Check if something is blocking the door before allowing toggle
+            door_rect = (door_pos.x - door_size.width // 2, door_pos.y - door_size.height // 2,
+                        door_size.width, door_size.height)
+            
+            # Check for players, enemies, or other obstacles blocking the door
+            is_blocked = False
+            
+            # Check players
+            for player_entity in self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent):
+                player_pos = player_entity.get_component(PositionComponent)
+                player_size = player_entity.get_component(SizeComponent)
+                margin = player_size.hitbox_margin
+                player_rect = (player_pos.x + margin, player_pos.y + margin,
+                              player_size.width - margin * 2, player_size.height - margin * 2)
+                if check_collision(door_rect, player_rect):
+                    is_blocked = True
+                    break
+            
+            # Check enemies
+            if not is_blocked:
+                for enemy_entity in self.world.get_entities_with(EnemyComponent, PositionComponent, SizeComponent):
+                    enemy_pos = enemy_entity.get_component(PositionComponent)
+                    enemy_size = enemy_entity.get_component(SizeComponent)
+                    enemy_rect = (enemy_pos.x, enemy_pos.y, enemy_size.width, enemy_size.height)
+                    if check_collision(door_rect, enemy_rect):
+                        is_blocked = True
+                        break
+            
+            # Check other obstacles (rocks, walls, etc.)
+            if not is_blocked:
+                for obstacle_entity in self.world.get_entities_with(PositionComponent, SizeComponent, CollisionComponent):
+                    if obstacle_entity.id == nearby_door.id:
+                        continue  # Skip the door itself
+                    obs_coll = obstacle_entity.get_component(CollisionComponent)
+                    if obs_coll.layer != "obstacle":
+                        continue
+                    obs_pos = obstacle_entity.get_component(PositionComponent)
+                    obs_size = obstacle_entity.get_component(SizeComponent)
+                    obs_rect = get_entity_rect(obstacle_entity)
+                    if obs_rect and check_collision(door_rect, obs_rect):
+                        is_blocked = True
+                        break
+            
+            # Only toggle if not blocked
+            if not is_blocked:
+                door.is_open = not door.is_open
+                
+                # Update door visual
+                sprite_comp = nearby_door.get_component(SpriteComponent)
+                if sprite_comp and sprite_comp.door_panel:
+                    if door.is_open:
+                        sprite_comp.door_panel.color = (100, 100, 100)  # Gray when open
+                        sprite_comp.door_panel.opacity = 100
+                    else:
+                        sprite_comp.door_panel.color = (139, 90, 43)  # Brown when closed
+                        sprite_comp.door_panel.opacity = 255
+        
+        # Update tooltip
+        if self.game_window and hasattr(self.game_window, 'door_tooltip'):
+            if nearby_door:
+                door = nearby_door.get_component(DoorComponent)
+                door_pos = nearby_door.get_component(PositionComponent)
+                door_size = nearby_door.get_component(SizeComponent)
+                
+                if door.is_open:
+                    self.game_window.door_tooltip.text = "Press SPACE to close"
+                else:
+                    self.game_window.door_tooltip.text = "Press SPACE to open"
+                
+                # Position tooltip near door
+                if self.game_window.world and self.game_window.world.camera:
+                    camera = self.game_window.world.camera
+                    screen_x, screen_y = camera.world_to_screen(door_pos.x, door_pos.y)
+                    self.game_window.door_tooltip.x = screen_x
+                    self.game_window.door_tooltip.y = screen_y + door_size.height // 2 + 20
+                
+                self.game_window.door_tooltip.visible = True
+            else:
+                self.game_window.door_tooltip.visible = False
+
+
+class StairsSystem(System):
+    """Handles stairs movement (changing height levels)."""
+    priority = 23
+    
+    def update(self, dt: float):
+        # Check players on stairs
+        for player_entity in self.world.get_entities_with(PlayerComponent, PositionComponent, SizeComponent, HeightComponent):
+            player_pos = player_entity.get_component(PositionComponent)
+            player_size = player_entity.get_component(SizeComponent)
+            player_height = player_entity.get_component(HeightComponent)
+            
+            player_center_x = player_pos.x + player_size.width / 2
+            player_center_y = player_pos.y + player_size.height / 2
+            player_rect = (player_pos.x, player_pos.y, player_size.width, player_size.height)
+            
+            # Check if player is on stairs
+            for stairs_entity in self.world.get_entities_with(StairsComponent, PositionComponent, SizeComponent, HeightComponent):
+                stairs_pos = stairs_entity.get_component(PositionComponent)
+                stairs_size = stairs_entity.get_component(SizeComponent)
+                stairs_comp = stairs_entity.get_component(StairsComponent)
+                stairs_height = stairs_entity.get_component(HeightComponent)
+                
+                stairs_rect = (stairs_pos.x - stairs_size.width // 2, stairs_pos.y - stairs_size.height // 2,
+                              stairs_size.width, stairs_size.height)
+                
+                if check_collision(player_rect, stairs_rect):
+                    # Check if moving in stairs direction
+                    dx = stairs_comp.direction_x
+                    dy = stairs_comp.direction_y
+                    if dx == 0 and dy == 0:
+                        continue
+                    
+                    # Determine if going up or down based on player position relative to stairs
+                    player_to_stairs_dx = player_center_x - stairs_pos.x
+                    player_to_stairs_dy = player_center_y - stairs_pos.y
+                    dot_product = player_to_stairs_dx * dx + player_to_stairs_dy * dy
+                    
+                    if dot_product > 0:  # Moving in direction of stairs (going up)
+                        if player_height.level == stairs_comp.from_level:
+                            player_height.level = stairs_comp.to_level
+                    else:  # Moving opposite direction (going down)
+                        if player_height.level == stairs_comp.to_level:
+                            player_height.level = stairs_comp.from_level
+        
+        # Check enemies on stairs
+        for enemy_entity in self.world.get_entities_with(EnemyComponent, PositionComponent, SizeComponent, HeightComponent):
+            enemy_pos = enemy_entity.get_component(PositionComponent)
+            enemy_size = enemy_entity.get_component(SizeComponent)
+            enemy_height = enemy_entity.get_component(HeightComponent)
+            
+            enemy_rect = (enemy_pos.x, enemy_pos.y, enemy_size.width, enemy_size.height)
+            
+            # Check if enemy is on stairs
+            for stairs_entity in self.world.get_entities_with(StairsComponent, PositionComponent, SizeComponent, HeightComponent):
+                stairs_pos = stairs_entity.get_component(PositionComponent)
+                stairs_size = stairs_entity.get_component(SizeComponent)
+                stairs_comp = stairs_entity.get_component(StairsComponent)
+                
+                stairs_rect = (stairs_pos.x - stairs_size.width // 2, stairs_pos.y - stairs_size.height // 2,
+                              stairs_size.width, stairs_size.height)
+                
+                if check_collision(enemy_rect, stairs_rect):
+                    # Enemies automatically move up/down stairs based on direction
+                    if enemy_height.level == stairs_comp.from_level:
+                        enemy_height.level = stairs_comp.to_level
+                    elif enemy_height.level == stairs_comp.to_level:
+                        enemy_height.level = stairs_comp.from_level
 
 
 class HarvestSystem(System):
@@ -1282,6 +1569,7 @@ class WallSystem(System):
         player_size = player_entity.get_component(SizeComponent)
         player_rect = (player_pos.x, player_pos.y, player_size.width, player_size.height)
         
+        # Handle walls
         for entity in self.world.get_entities_with(WallComponent, PositionComponent, SizeComponent):
             wall = entity.get_component(WallComponent)
             if not wall.is_solid and wall.owner_id == player_entity.id:
@@ -1292,6 +1580,18 @@ class WallSystem(System):
                 
                 if not check_collision(player_rect, wall_rect):
                     wall.is_solid = True
+        
+        # Handle doors - make them blocking when closed and player moves away
+        for entity in self.world.get_entities_with(DoorComponent, PositionComponent, SizeComponent):
+            door = entity.get_component(DoorComponent)
+            if not door.is_blocking and door.owner_id == player_entity.id and not door.is_open:
+                door_pos = entity.get_component(PositionComponent)
+                door_size = entity.get_component(SizeComponent)
+                door_rect = (door_pos.x - door_size.width // 2, door_pos.y - door_size.height // 2,
+                           door_size.width, door_size.height)
+                
+                if not check_collision(player_rect, door_rect):
+                    door.is_blocking = True
 
 
 class RenderSystem(System):
@@ -1389,6 +1689,40 @@ class RenderSystem(System):
                     sprite_comp.shapes[4].y = actual_y + 3 * size_comp.height // 4
                 continue
             
+            door = entity.get_component(DoorComponent)
+            if door:
+                size_comp = entity.get_component(SizeComponent)
+                half_w = size_comp.width // 2
+                half_h = size_comp.height // 2
+                actual_x = screen_x - half_w
+                actual_y = screen_y - half_h
+                
+                if len(sprite_comp.shapes) >= 2:
+                    sprite_comp.shapes[0].x = actual_x  # Frame
+                    sprite_comp.shapes[0].y = actual_y
+                    if sprite_comp.door_panel:
+                        sprite_comp.door_panel.x = actual_x + 2
+                        sprite_comp.door_panel.y = actual_y + 2
+                continue
+            
+            stairs = entity.get_component(StairsComponent)
+            if stairs:
+                size_comp = entity.get_component(SizeComponent)
+                half_w = size_comp.width // 2
+                half_h = size_comp.height // 2
+                actual_x = screen_x - half_w
+                actual_y = screen_y - half_h
+                
+                for i, shape in enumerate(sprite_comp.shapes):
+                    if i == 0:
+                        shape.x = actual_x  # Base
+                        shape.y = actual_y
+                    else:
+                        step_y = actual_y + (size_comp.height // 3) * (i - 1)
+                        shape.x = actual_x
+                        shape.y = step_y
+                continue
+            
             if enemy and sprite_comp.shapes and not sprite_comp.sprite:
                 for shape in sprite_comp.shapes:
                     shape.x = screen_x
@@ -1416,6 +1750,7 @@ def create_player(world: World, x: float, y: float, player_id: int = 1, color=GR
     entity.add_component(SizeComponent(width=PLAYER_SIZE, height=PLAYER_SIZE, hitbox_margin=PLAYER_HITBOX_MARGIN))
     entity.add_component(PlayerComponent(player_id=player_id))
     entity.add_component(InputComponent())
+    entity.add_component(HeightComponent(level=0))  # Players start at ground level
     entity.add_component(CollisionComponent(layer="player", collides_with=["enemy", "obstacle"]))
     entity.add_component(TagComponent(tags={"player"}))
     
@@ -1438,6 +1773,7 @@ def create_enemy(world: World, x: float, y: float, enemy_id: int = None) -> Enti
     entity.add_component(VelocityComponent(speed=ENEMY_SPEED))
     entity.add_component(SizeComponent(width=ENEMY_SIZE, height=ENEMY_SIZE))
     entity.add_component(EnemyComponent(enemy_id=enemy_id or random.randint(1000, 9999)))
+    entity.add_component(HeightComponent(level=0))  # Enemies start at ground level
     entity.add_component(CollisionComponent(layer="enemy", collides_with=["player", "projectile"]))
     entity.add_component(TagComponent(tags={"enemy"}))
     
@@ -1496,6 +1832,7 @@ def create_rock(world: World, x: float, y: float, size: int) -> Entity:
     entity.add_component(PositionComponent(x=x, y=y))
     entity.add_component(SizeComponent(width=size, height=size))
     entity.add_component(RockComponent(rock_id=random.randint(3000, 9999)))
+    entity.add_component(HeightComponent(level=1))  # Rocks have height 1
     entity.add_component(CollisionComponent(layer="obstacle", collides_with=["player", "enemy", "projectile"]))
     entity.add_component(TagComponent(tags={"rock", "obstacle"}))
     
@@ -1540,6 +1877,7 @@ def create_wall(world: World, x: float, y: float, owner_id: int = None) -> Entit
     entity.add_component(PositionComponent(x=x, y=y))
     entity.add_component(SizeComponent(width=WALL_SIZE, height=WALL_SIZE))
     entity.add_component(WallComponent(owner_id=owner_id, is_solid=False))
+    entity.add_component(HeightComponent(level=1))  # Walls have height 1
     entity.add_component(CollisionComponent(layer="obstacle", collides_with=["player", "enemy", "projectile"]))
     entity.add_component(TagComponent(tags={"wall", "obstacle"}))
     
@@ -1555,6 +1893,50 @@ def create_wall(world: World, x: float, y: float, owner_id: int = None) -> Entit
         sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
         sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
         sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE - 4, 2, color=(120, 75, 35), batch=world.batch))
+    entity.add_component(sprite_comp)
+    
+    return entity
+
+def create_door(world: World, x: float, y: float, owner_id: int = None) -> Entity:
+    """Create a door entity."""
+    entity = world.create_entity()
+    
+    entity.add_component(PositionComponent(x=x, y=y))
+    entity.add_component(SizeComponent(width=WALL_SIZE, height=WALL_SIZE))
+    entity.add_component(DoorComponent(owner_id=owner_id, is_open=False, is_blocking=False))
+    entity.add_component(HeightComponent(level=1))  # Doors have height 1 like walls
+    entity.add_component(CollisionComponent(layer="obstacle", collides_with=["player", "enemy", "projectile"]))
+    entity.add_component(TagComponent(tags={"door", "obstacle"}))
+    
+    sprite_comp = SpriteComponent()
+    # Door frame (always visible)
+    sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE, WALL_SIZE, color=(101, 67, 33), batch=world.batch))
+    # Door panel (changes color when open)
+    sprite_comp.door_panel = shapes.Rectangle(0, 0, WALL_SIZE - 4, WALL_SIZE - 4, color=(139, 90, 43), batch=world.batch)
+    sprite_comp.add_shape(sprite_comp.door_panel)
+    entity.add_component(sprite_comp)
+    
+    return entity
+
+def create_stairs(world: World, x: float, y: float, direction_x: float, direction_y: float, from_level: int, to_level: int, owner_id: int = None) -> Entity:
+    """Create a stairs entity."""
+    entity = world.create_entity()
+    
+    entity.add_component(PositionComponent(x=x, y=y))
+    entity.add_component(SizeComponent(width=WALL_SIZE, height=WALL_SIZE))
+    entity.add_component(StairsComponent(owner_id=owner_id, direction_x=direction_x, direction_y=direction_y, from_level=from_level, to_level=to_level))
+    entity.add_component(HeightComponent(level=from_level))  # Stairs are at the from_level
+    # Stairs don't block movement - they're just for changing height levels
+    # No CollisionComponent - stairs allow passage
+    entity.add_component(TagComponent(tags={"stairs"}))
+    
+    sprite_comp = SpriteComponent()
+    # Stairs base
+    sprite_comp.add_shape(shapes.Rectangle(0, 0, WALL_SIZE, WALL_SIZE, color=(120, 120, 120), batch=world.batch))
+    # Stairs steps
+    for i in range(3):
+        step_y = (WALL_SIZE // 3) * i
+        sprite_comp.add_shape(shapes.Rectangle(0, step_y, WALL_SIZE, WALL_SIZE // 6, color=(150, 150, 150), batch=world.batch))
     entity.add_component(sprite_comp)
     
     return entity
@@ -2107,6 +2489,8 @@ class GameWindow(pyglet.window.Window):
         self.world.add_system(MovementSystem())
         self.world.add_system(EnemyAISystem())
         self.world.add_system(ProjectileSystem())
+        self.world.add_system(InteractionSystem(self))
+        self.world.add_system(StairsSystem())
         self.world.add_system(HarvestSystem())
         self.world.add_system(WallSystem())
         self.world.add_system(CollisionSystem(self))
@@ -2130,7 +2514,11 @@ class GameWindow(pyglet.window.Window):
         self.build_menu_open = False
         self.build_menu_last_used = 0.0
         self.selected_building = 1
-        self.building_types = {1: {'name': 'Wooden Wall', 'cost': WALL_WOOD_COST, 'resource': 'wood'}}
+        self.building_types = {
+            1: {'name': 'Wooden Wall', 'cost': WALL_WOOD_COST, 'resource': 'wood', 'type': 'wall'},
+            2: {'name': 'Door', 'cost': WALL_WOOD_COST, 'resource': 'wood', 'type': 'door'},
+            3: {'name': 'Stairs', 'cost': WALL_WOOD_COST, 'resource': 'wood', 'type': 'stairs'}
+        }
         
         # Create UI elements
         self._create_ui()
@@ -2146,7 +2534,7 @@ class GameWindow(pyglet.window.Window):
         """Create all UI elements."""
         # Build menu
         self.build_menu_bg = shapes.Rectangle(
-            SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT - 60, 300, 50,
+            SCREEN_WIDTH // 2 - 150, SCREEN_HEIGHT - 80, 300, 75,
             color=(30, 30, 30), batch=self.batch
         )
         self.build_menu_bg.opacity = 180
@@ -2164,11 +2552,29 @@ class GameWindow(pyglet.window.Window):
         self.build_menu_item1 = pyglet.text.Label(
             f'[1] Wooden Wall ({WALL_WOOD_COST} wood)',
             font_name='Arial', font_size=12,
-            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 42,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 35,
             anchor_x='center', anchor_y='center',
             color=(255, 255, 0, 255), batch=self.batch
         )
         self.build_menu_item1.visible = False
+        
+        self.build_menu_item2 = pyglet.text.Label(
+            f'[2] Door ({WALL_WOOD_COST} wood)',
+            font_name='Arial', font_size=12,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 50,
+            anchor_x='center', anchor_y='center',
+            color=(255, 255, 0, 255), batch=self.batch
+        )
+        self.build_menu_item2.visible = False
+        
+        self.build_menu_item3 = pyglet.text.Label(
+            f'[3] Stairs ({WALL_WOOD_COST} wood)',
+            font_name='Arial', font_size=12,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 65,
+            anchor_x='center', anchor_y='center',
+            color=(255, 255, 0, 255), batch=self.batch
+        )
+        self.build_menu_item3.visible = False
         
         # Enemy counter
         self.score_label = pyglet.text.Label(
@@ -2223,6 +2629,16 @@ class GameWindow(pyglet.window.Window):
         self.reload_circle_bg = shapes.Circle(0, 0, self.reload_circle_radius, color=(50, 50, 50), batch=self.batch)
         self.reload_circle_bg.opacity = 150
         self.reload_arc_segments = []
+        
+        # Door interaction tooltip
+        self.door_tooltip = pyglet.text.Label(
+            'Press SPACE to open',
+            font_name='Arial', font_size=14,
+            x=SCREEN_WIDTH // 2, y=SCREEN_HEIGHT - 100,
+            anchor_x='center', anchor_y='center',
+            color=(255, 255, 200, 255), batch=self.batch
+        )
+        self.door_tooltip.visible = False
     
     def check_connection(self):
         if self.network and not self.network.connected:
@@ -2249,6 +2665,10 @@ class GameWindow(pyglet.window.Window):
         elif self.build_menu_open:
             if symbol == pyglet.window.key._1 or symbol == pyglet.window.key.NUM_1:
                 self.select_building(1)
+            elif symbol == pyglet.window.key._2 or symbol == pyglet.window.key.NUM_2:
+                self.select_building(2)
+            elif symbol == pyglet.window.key._3 or symbol == pyglet.window.key.NUM_3:
+                self.select_building(3)
         
         if symbol == pyglet.window.key.ESCAPE:
             if self.build_menu_open:
@@ -2271,6 +2691,8 @@ class GameWindow(pyglet.window.Window):
         self.build_menu_bg.visible = show
         self.build_menu_title.visible = show
         self.build_menu_item1.visible = show
+        self.build_menu_item2.visible = show
+        self.build_menu_item3.visible = show
     
     def select_building(self, building_id):
         if building_id in self.building_types:
@@ -2296,28 +2718,97 @@ class GameWindow(pyglet.window.Window):
             player_center_y = player_pos.y + player_size.height / 2
             grid_x, grid_y = snap_to_grid(player_center_x, player_center_y)
             
-            wall_rect = (grid_x - WALL_SIZE // 2, grid_y - WALL_SIZE // 2, WALL_SIZE, WALL_SIZE)
+            build_rect = (grid_x - WALL_SIZE // 2, grid_y - WALL_SIZE // 2, WALL_SIZE, WALL_SIZE)
             can_build = True
             
-            # Check existing walls and obstacles
+            # Check existing buildings and obstacles
             for entity in self.world.get_entities_with(WallComponent, PositionComponent, SizeComponent):
                 pos = entity.get_component(PositionComponent)
                 sz = entity.get_component(SizeComponent)
-                if check_collision(wall_rect, (pos.x - sz.width // 2, pos.y - sz.height // 2, sz.width, sz.height)):
+                if check_collision(build_rect, (pos.x - sz.width // 2, pos.y - sz.height // 2, sz.width, sz.height)):
                     can_build = False
                     break
+            
+            if can_build:
+                for entity in self.world.get_entities_with(DoorComponent, PositionComponent, SizeComponent):
+                    pos = entity.get_component(PositionComponent)
+                    sz = entity.get_component(SizeComponent)
+                    if check_collision(build_rect, (pos.x - sz.width // 2, pos.y - sz.height // 2, sz.width, sz.height)):
+                        can_build = False
+                        break
+            
+            if can_build:
+                for entity in self.world.get_entities_with(StairsComponent, PositionComponent, SizeComponent):
+                    pos = entity.get_component(PositionComponent)
+                    sz = entity.get_component(SizeComponent)
+                    if check_collision(build_rect, (pos.x - sz.width // 2, pos.y - sz.height // 2, sz.width, sz.height)):
+                        can_build = False
+                        break
             
             if can_build:
                 for entity in self.world.get_entities_with(RockComponent, PositionComponent, SizeComponent):
                     pos = entity.get_component(PositionComponent)
                     sz = entity.get_component(SizeComponent)
-                    if check_collision(wall_rect, (pos.x, pos.y, sz.width, sz.height)):
+                    if check_collision(build_rect, (pos.x, pos.y, sz.width, sz.height)):
                         can_build = False
                         break
             
             if can_build:
-                create_wall(self.world, grid_x, grid_y, self.player_entity.id)
-                player_comp.wood -= cost
+                building_type = building.get('type', 'wall')
+                if building_type == 'wall':
+                    create_wall(self.world, grid_x, grid_y, self.player_entity.id)
+                    player_comp.wood -= cost
+                elif building_type == 'door':
+                    create_door(self.world, grid_x, grid_y, self.player_entity.id)
+                    player_comp.wood -= cost
+                elif building_type == 'stairs':
+                    # Get player height level
+                    player_height = self.player_entity.get_component(HeightComponent)
+                    current_level = player_height.level if player_height else 0
+                    
+                    # Find closest obstacle with higher level
+                    target_entity = None
+                    min_dist = float('inf')
+                    for entity in self.world.get_entities_with(PositionComponent, SizeComponent, HeightComponent):
+                        entity_height = entity.get_component(HeightComponent)
+                        if not entity_height or entity_height.level <= current_level:
+                            continue
+                        
+                        entity_pos = entity.get_component(PositionComponent)
+                        entity_size = entity.get_component(SizeComponent)
+                        entity_center_x = entity_pos.x
+                        entity_center_y = entity_pos.y
+                        
+                        dx = entity_center_x - grid_x
+                        dy = entity_center_y - grid_y
+                        dist = math.sqrt(dx**2 + dy**2)
+                        
+                        if dist < min_dist:
+                            min_dist = dist
+                            target_entity = entity
+                    
+                    # Calculate direction towards target (or default direction if no target)
+                    if target_entity:
+                        target_pos = target_entity.get_component(PositionComponent)
+                        dir_x = target_pos.x - grid_x
+                        dir_y = target_pos.y - grid_y
+                        dir_length = math.sqrt(dir_x**2 + dir_y**2)
+                        if dir_length > 0:
+                            dir_x /= dir_length
+                            dir_y /= dir_length
+                        else:
+                            dir_x, dir_y = 1.0, 0.0
+                    else:
+                        dir_x, dir_y = 1.0, 0.0  # Default direction
+                    
+                    target_level = current_level + 1
+                    if target_entity:
+                        target_height = target_entity.get_component(HeightComponent)
+                        if target_height:
+                            target_level = target_height.level
+                    
+                    create_stairs(self.world, grid_x, grid_y, dir_x, dir_y, current_level, target_level, self.player_entity.id)
+                    player_comp.wood -= cost
     
     def try_shoot(self, dt):
         current_time = self.game_time
